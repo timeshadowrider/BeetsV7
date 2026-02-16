@@ -1,0 +1,60 @@
+services:
+  beets-single:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: beetsV7
+    restart: unless-stopped
+
+    # Put beets on the same network as Navidrome
+    networks:
+      - media-bridge
+
+    ports:
+      - "7080:7080"
+      - "8337:8337"
+
+    environment:
+      BEETSDIR: /config
+      BEETS_LIBRARY: /data/library.db
+      APP_PORT: "7080"
+      INBOX_DIR: /inbox
+      VOLUMIO_URL: "http://10.0.0.102"
+      VOLUMIO_MUSIC_MOUNT: "INTERNAL"
+
+    user: "1000:1000"
+
+    volumes:
+      # static + public
+      - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/static:/app/static:ro
+      - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/public:/app/public:ro
+
+      # config + data
+      - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/config:/config:rw
+      - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/data:/data:rw
+
+      # pipeline volumes
+      - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/pre-library:/pre-library
+      - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/clean:/music/library
+      - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Downloads/Audio:/inbox
+      - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/quarantine:/music/quarantine
+
+      # backend + scripts
+      - ../backend:/app/backend:rw
+      - ../scripts:/app/scripts:rw
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:7080/api/stats || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  media-bridge:
+    external: true

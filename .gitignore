@@ -1,0 +1,68 @@
+# --- Project-specific ignores ---
+Archive/
+archive/
+archive*/
+*/archive/
+*/Archive/
+
+# Backup files
+*.bak
+*bak*
+*backup*
+*Backup*
+*BACKUP*
+
+# Backup folders
+backup/
+Backup/
+BACKUP/
+*/backup/
+*/Backup/
+*/BACKUP/
+
+# SSH keys
+deploy_key
+id_rsa
+id_ed25519
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+.venv/
+
+# Logs
+*.log
+logs/
+*/logs/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker
+docker-data/
+docker-volume/
+*/docker-data/
+*/docker-volume/
+*.pid
+
+# Temp files
+*.tmp
+*.temp
+*.swp
+*.swo
+*.orig
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Node / frontend
+node_modules/
+dist/
+build/

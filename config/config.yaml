@@ -1,0 +1,208 @@
+# ============================================================================
+# BEETS CONFIGURATION - v7 (Full Import Mode, All Plugins Preserved)
+# ============================================================================
+
+directory: /music/library
+library: /data/library.db
+
+ui:
+  color: yes
+
+asciify_paths: no
+per_disc_numbering: no
+threaded: yes
+
+paths:
+  default: $albumartist/($year) $album/$track $title
+  singleton: Non-Album/$artist/($year) Singles/$title
+  comp: Compilations/($year) $album/$track $title
+
+# ----------------------------------------------------------------------------
+# IMPORT SETTINGS (UPDATED FOR VERSION 7)
+# ----------------------------------------------------------------------------
+import:
+  incremental: no
+  move: yes          # v7: Beets now promotes files into /music/library
+  copy: no
+  write: yes
+  log: /data/last_beets_imports.log
+  quiet_fallback: asis
+  detail: yes
+  duplicate_action: skip
+  timid: no
+  autotag: yes
+  fingerprint: yes   # v7: allow AcoustID ? MusicBrainz matching
+  art: yes
+  strong_rec_thresh: 0.25
+  none_rec_action: skip
+  group_albums: yes
+  resume: no
+  singleton: yes
+
+# ----------------------------------------------------------------------------
+# MATCHING & METADATA
+# ----------------------------------------------------------------------------
+match:
+  unmatched_tracks: keep
+  distance_weights:
+    track_title: 1.0
+    track_artist: 1.0
+    album: 1.0
+    track_index: 1.0
+    track_length: 1.0
+    data_source: 0.0
+    missing_tracks: 0.2
+
+tiebreak:
+  bitrate: desc
+  format: [FLAC, ALAC, AAC, MP3]
+  bitdepth: desc
+  samplerate: desc
+
+logging:
+  level: INFO
+  handlers:
+    file:
+      filename: /data/beets.log
+      format: '%(asctime)s [%(levelname)s] %(message)s'
+
+# ----------------------------------------------------------------------------
+# PLUGINS (ALL YOUR ORIGINAL PLUGINS PRESERVED)
+# ----------------------------------------------------------------------------
+plugins:
+  - info
+  - edit
+  - mbsync
+  - missing
+  - inline
+  - fromfilename
+  - scrub
+  - zero
+  - the
+  - ftintitle
+  - lastgenre
+  - albumtypes
+  - musicbrainz
+  - lyrics
+  - fetchart
+  - embedart
+  - plexupdate
+  - mpdupdate  
+  - smartplaylist
+
+# ----------------------------------------------------------------------------
+# INLINE METADATA NORMALIZATION (UNCHANGED)
+# ----------------------------------------------------------------------------
+inline:
+  albumartist: |
+    import re
+    normalized = re.sub(
+        r'\s*(?:&|and|x|X|feat\.?|ft\.?|featuring|with|vs\.?)\s*',
+        '|||',
+        albumartist,
+        flags=re.IGNORECASE
+    )
+    return normalized.split('|||')[0].strip()
+
+  artist: |
+    import re
+    normalized = re.sub(
+        r'\s*(?:&|and|x|X|feat\.?|ft\.?|featuring|with|vs\.?)\s*',
+        '|||',
+        artist,
+        flags=re.IGNORECASE
+    )
+    return normalized.split('|||')[0].strip()
+
+# ----------------------------------------------------------------------------
+# ARTWORK (UNCHANGED)
+# ----------------------------------------------------------------------------
+embedart:
+  auto: yes
+  ifempty: yes
+  remove_art_file: no
+  maxwidth: 1200
+
+fetchart:
+  minwidth: 500
+  maxwidth: 1200
+  enforce_ratio: 10px
+  auto: yes
+  art_filename: cover
+  sources: [coverart, filesystem, lastfm, fanarttv]
+  lastfm_key: 91521efedd7bca03e6e8d4aa570eb61b
+  fanarttv_key: 7cf7143c127fe59f11836a438237b4cb
+  store_source: yes
+  cover_names: [cover, folder, front]
+
+# ----------------------------------------------------------------------------
+# FEATURED ARTISTS IN TITLE (UNCHANGED)
+# ----------------------------------------------------------------------------
+ftintitle:
+  auto: yes
+  format: "(feat. {0})"
+
+# ----------------------------------------------------------------------------
+# GENRE (UNCHANGED)
+# ----------------------------------------------------------------------------
+lastgenre:
+  auto: yes
+  count: 4
+  prefer_specific: yes
+  force: yes
+  source: track
+  separator: "; "
+  fallback: ""
+
+# ----------------------------------------------------------------------------
+# LYRICS (UNCHANGED)
+# ----------------------------------------------------------------------------
+lyrics:
+  auto: yes
+  sources: [genius, lrclib, google]
+  genius_api_key: "-nO5NHAXNudMKIa7syQBkGDjFWhfy1-v5dmYIGS76USKyqeMfvZZnV0-1dCtpHHg"
+
+# ----------------------------------------------------------------------------
+# MPD (UNCHANGED)
+# ----------------------------------------------------------------------------
+mpd:
+  host: 10.0.0.102
+  port: 6600
+
+# ----------------------------------------------------------------------------
+# PLEX (UNCHANGED)
+# ----------------------------------------------------------------------------
+plex:
+  host: 10.0.0.100
+  port: 32400
+  token: rEn12-HUTx1TsfYDyDpz
+
+# ----------------------------------------------------------------------------
+# SUBSONIC (UNCHANGED)
+# ----------------------------------------------------------------------------
+#subsonic:
+#  host: http://10.0.0.100
+#  port: 4533
+#  user: timeshadowrider
+#  pass: 'An|t@theR@bb|t'
+#  contextpath: /
+
+# ----------------------------------------------------------------------------
+# SMART PLAYLISTS (UNCHANGED)
+# ----------------------------------------------------------------------------
+smartplaylist:
+  relative_to: /music/library
+  playlist_dir: /music/playlists
+  playlists:
+    - name: All_Music.m3u
+      query: ""
+    - name: Recent_Additions.m3u
+      query: "added:-30d.."
+    - name: High_Quality.m3u
+      query: "bitrate:320000.."
+
+# ----------------------------------------------------------------------------
+# ZERO (UNCHANGED)
+# ----------------------------------------------------------------------------
+zero:
+  fields: [art]
