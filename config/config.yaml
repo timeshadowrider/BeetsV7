@@ -1,5 +1,10 @@
 # ============================================================================
-# BEETS CONFIGURATION - v7 (Full Import Mode, All Plugins Preserved)
+# BEETS CONFIGURATION - v7.4
+# Key changes from v7.3:
+# - quiet_fallback: asis  (was: skip) - imports with existing tags if no match
+# - none_rec_action: asis (was: skip) - same for zero-confidence matches
+# - strong_rec_thresh: 0.10 (was: 0.25) - more lenient matching
+# - original_date: yes - use original release year in $original_year field
 # ============================================================================
 
 directory: /music/library
@@ -11,39 +16,46 @@ ui:
 asciify_paths: no
 per_disc_numbering: no
 threaded: yes
+original_date: yes
 
 paths:
-  default: $albumartist/($year) $album/$track $title
+  default: $albumartist/($year) $album%if{$albumdisambig, [$albumdisambig]}/$track $title
   singleton: Non-Album/$artist/($year) Singles/$title
-  comp: Compilations/($year) $album/$track $title
+  comp: Compilations/($year) $album%if{$albumdisambig, [$albumdisambig]}/$track $title
 
 # ----------------------------------------------------------------------------
-# IMPORT SETTINGS (UPDATED FOR VERSION 7)
+# IMPORT SETTINGS
 # ----------------------------------------------------------------------------
 import:
   incremental: no
-  move: yes          # v7: Beets now promotes files into /music/library
+  move: yes
   copy: no
   write: yes
   log: /data/last_beets_imports.log
-  quiet_fallback: skip
   detail: yes
   duplicate_action: skip
   timid: no
   autotag: yes
-  fingerprint: yes   # v7: allow AcoustID ? MusicBrainz matching
+  fingerprint: yes
   art: yes
-  strong_rec_thresh: 0.25
-  none_rec_action: skip
   group_albums: yes
   resume: no
   singleton: yes
+
+  # KEY FIXES - was 'skip', now 'asis'
+  # 'asis' imports with existing file tags rather than abandoning to failed_imports
+  quiet_fallback: asis
+  none_rec_action: asis
 
 # ----------------------------------------------------------------------------
 # MATCHING & METADATA
 # ----------------------------------------------------------------------------
 match:
   unmatched_tracks: keep
+
+  # Lowered from 0.25 to 0.10 - less strict, fewer false failures
+  strong_rec_thresh: 0.10
+
   distance_weights:
     track_title: 1.0
     track_artist: 1.0
@@ -67,7 +79,7 @@ logging:
       format: '%(asctime)s [%(levelname)s] %(message)s'
 
 # ----------------------------------------------------------------------------
-# PLUGINS (ALL YOUR ORIGINAL PLUGINS PRESERVED)
+# PLUGINS
 # ----------------------------------------------------------------------------
 plugins:
   - info
@@ -82,16 +94,17 @@ plugins:
   - ftintitle
   - lastgenre
   - albumtypes
+  - discogs
   - musicbrainz
   - lyrics
   - fetchart
   - embedart
   - plexupdate
-  - mpdupdate  
+  - mpdupdate
   - smartplaylist
 
 # ----------------------------------------------------------------------------
-# INLINE METADATA NORMALIZATION (UNCHANGED)
+# INLINE METADATA NORMALIZATION
 # ----------------------------------------------------------------------------
 inline:
   albumartist: |
@@ -115,7 +128,7 @@ inline:
     return normalized.split('|||')[0].strip()
 
 # ----------------------------------------------------------------------------
-# ARTWORK (UNCHANGED)
+# ARTWORK
 # ----------------------------------------------------------------------------
 embedart:
   auto: yes
@@ -136,14 +149,14 @@ fetchart:
   cover_names: [cover, folder, front]
 
 # ----------------------------------------------------------------------------
-# FEATURED ARTISTS IN TITLE (UNCHANGED)
+# FEATURED ARTISTS IN TITLE
 # ----------------------------------------------------------------------------
 ftintitle:
   auto: yes
   format: "(feat. {0})"
 
 # ----------------------------------------------------------------------------
-# GENRE (UNCHANGED)
+# GENRE
 # ----------------------------------------------------------------------------
 lastgenre:
   auto: yes
@@ -155,7 +168,13 @@ lastgenre:
   fallback: ""
 
 # ----------------------------------------------------------------------------
-# LYRICS (UNCHANGED)
+# DISCOGS
+# ----------------------------------------------------------------------------
+discogs:
+  user_token: nSxVRTjzwbgIxzManORnSuDCIUEqouNYUcKymrHv
+
+# ----------------------------------------------------------------------------
+# LYRICS
 # ----------------------------------------------------------------------------
 lyrics:
   auto: yes
@@ -163,14 +182,14 @@ lyrics:
   genius_api_key: "-nO5NHAXNudMKIa7syQBkGDjFWhfy1-v5dmYIGS76USKyqeMfvZZnV0-1dCtpHHg"
 
 # ----------------------------------------------------------------------------
-# MPD (UNCHANGED)
+# MPD
 # ----------------------------------------------------------------------------
 mpd:
   host: 10.0.0.102
   port: 6600
 
 # ----------------------------------------------------------------------------
-# PLEX (UNCHANGED)
+# PLEX
 # ----------------------------------------------------------------------------
 plex:
   host: 10.0.0.100
@@ -178,7 +197,7 @@ plex:
   token: rEn12-HUTx1TsfYDyDpz
 
 # ----------------------------------------------------------------------------
-# SUBSONIC (UNCHANGED)
+# SUBSONIC (disabled)
 # ----------------------------------------------------------------------------
 #subsonic:
 #  host: http://10.0.0.100
@@ -188,7 +207,7 @@ plex:
 #  contextpath: /
 
 # ----------------------------------------------------------------------------
-# SMART PLAYLISTS (UNCHANGED)
+# SMART PLAYLISTS
 # ----------------------------------------------------------------------------
 smartplaylist:
   relative_to: /music/library
@@ -202,7 +221,7 @@ smartplaylist:
       query: "bitrate:320000.."
 
 # ----------------------------------------------------------------------------
-# ZERO (UNCHANGED)
+# ZERO
 # ----------------------------------------------------------------------------
 zero:
   fields: [art]

@@ -1,143 +1,120 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Beets Integration Module - v7 (CORRECTED)
-
-Fixed Issues:
-- Post-import updates look in /music/library (not /pre-library)
-- Proper error handling and logging
-- Files should move from /pre-library to /music/library
+Beets Integration Module - v7.4
 """
 from .util import run, PRELIB, LIBRARY
 from .logging import vlog, log
 from pathlib import Path
 
+# FIX: These are suffix patterns for Path.suffix comparisons, NOT glob patterns.
+# Use lowercase extensions with leading dot, not "*.flac" glob syntax.
+AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
+
+# Glob patterns used only where Path.glob() is called
+AUDIO_GLOBS = ["**/*.flac", "**/*.mp3", "**/*.m4a", "**/*.ogg", "**/*.wav", "**/*.aac"]
+
 
 def run_fingerprint():
-    """Run AcoustID fingerprinting on all files in /pre-library"""
+    """Run AcoustID fingerprinting on all files in /pre-library."""
     vlog("[FP] Running fingerprint pass...")
-    
-    # Check if there are files to fingerprint
+
     if not PRELIB.exists() or not any(PRELIB.iterdir()):
         vlog("[FP] No files in /pre-library to fingerprint")
         return
-    
+
     try:
         run(["python3", "/app/scripts/fingerprint_all.py"])
         vlog("[FP] Fingerprinting completed")
     except Exception as e:
-        log(f"[FP] Warning: Fingerprinting failed: {e}")
+        log("[FP] Warning: Fingerprinting failed: %s" % e)
 
 
 def run_beets_import():
     """
     Import files from /pre-library to /music/library.
-    
-    With move: yes in config.yaml, files will be:
-    1. Matched against MusicBrainz
-    2. Tagged with metadata
-    3. MOVED to /music/library
-    4. Removed from /pre-library
-    
-    Failed imports stay in /pre-library/failed_imports
+
+    Uses --quiet so Beets is non-interactive but still respects
+    quiet_fallback and none_rec_action from config.yaml (set to 'asis').
     """
     vlog("[BEETS] Importing pre-library...")
-    
-    # Check if there are files to import
+
     if not PRELIB.exists() or not any(PRELIB.iterdir()):
         vlog("[BEETS] No files in /pre-library to import")
         return
-    
+
     try:
-        # Import from /pre-library
-        # Files will be moved to /music/library based on config.yaml
-        run(["beet", "import", "-q", str(PRELIB)])
+        run(["beet", "import", "--quiet", str(PRELIB)])
         vlog("[BEETS] Import completed")
-        
-        # Verify files moved
-        remaining = list(PRELIB.glob("**/*.flac")) + list(PRELIB.glob("**/*.mp3"))
-        # Filter out failed_imports directory
-        remaining = [f for f in remaining if "failed_imports" not in str(f)]
-        
+
+        # Diagnostic: log any files still in /pre-library (outside failed_imports)
+        remaining = []
+        for pattern in AUDIO_GLOBS:
+            for f in PRELIB.glob(pattern):
+                if "failed_imports" not in str(f):
+                    remaining.append(f)
+
         if remaining:
-            log(f"[BEETS] Warning: {len(remaining)} files still in /pre-library after import")
-            # These might be files that couldn't be matched
+            log("[BEETS] Warning: %d files still in /pre-library after import:" % len(remaining))
+            for f in remaining[:10]:
+                log("[BEETS]   %s" % f)
+            if len(remaining) > 10:
+                log("[BEETS]   ... and %d more" % (len(remaining) - 10))
         else:
             vlog("[BEETS] All files successfully moved from /pre-library")
-            
+
     except Exception as e:
-        log(f"[BEETS] Import error: {e}")
+        log("[BEETS] Import error: %s" % e)
 
 
 def run_post_import():
-    """
-    Post-import cleanup and updates.
-    
-    CRITICAL FIX: After import with move:yes, files are in /music/library,
-    NOT in /pre-library anymore. So we update files in the library location.
-    """
+    """Post-import updates scoped to recently added files only."""
     vlog("[BEETS] Post-import update/move...")
-    
+
     try:
-        # Update metadata for files that were just imported
-        # Look for recently added files (within last hour)
         vlog("[BEETS] Updating recently imported files...")
         run(["beet", "update", "added:-1h.."])
-        
-        # Ensure any files that should be moved are moved
-        # This catches files that may have been imported but not moved
+
         vlog("[BEETS] Ensuring files are in correct location...")
-        run(["beet", "move"])
-        
-        # Final update pass on the entire library
-        # This ensures all tags are written
-        vlog("[BEETS] Final metadata update...")
-        run(["beet", "update", "path:%s" % LIBRARY])
-        
+        run(["beet", "move", "added:-1h.."])
+
         vlog("[BEETS] Post-import completed")
-        
+
     except Exception as e:
-        log(f"[BEETS] Post-import warning: {e}")
+        log("[BEETS] Post-import warning: %s" % e)
+
+    verify_import_success()
 
 
 def verify_import_success():
-    """
-    Verify that files successfully moved from /pre-library to /music/library.
-    
-    Returns:
-        dict: Statistics about the import
-    """
+    """Log import statistics after each run."""
     stats = {
         "prelib_remaining": 0,
         "library_total": 0,
-        "failed_imports": 0
+        "failed_imports": 0,
     }
-    
-    # Count files still in /pre-library (excluding failed_imports)
+
     if PRELIB.exists():
-        for ext in ["*.flac", "*.mp3", "*.m4a"]:
-            files = list(PRELIB.glob(f"**/{ext}"))
-            files = [f for f in files if "failed_imports" not in str(f)]
-            stats["prelib_remaining"] += len(files)
-    
-    # Count files in /music/library
+        for pattern in AUDIO_GLOBS:
+            for f in PRELIB.glob(pattern):
+                if "failed_imports" not in str(f):
+                    stats["prelib_remaining"] += 1
+
     if LIBRARY.exists():
-        for ext in ["*.flac", "*.mp3", "*.m4a"]:
-            stats["library_total"] += len(list(LIBRARY.glob(f"**/{ext}")))
-    
-    # Count failed imports
+        for pattern in AUDIO_GLOBS:
+            stats["library_total"] += len(list(LIBRARY.glob(pattern)))
+
     failed_dir = PRELIB / "failed_imports"
     if failed_dir.exists():
-        for ext in ["*.flac", "*.mp3", "*.m4a"]:
-            stats["failed_imports"] += len(list(failed_dir.glob(f"**/{ext}")))
-    
-    # Log results
-    log(f"[VERIFY] Import Statistics:")
-    log(f"[VERIFY]   Library: {stats['library_total']} files")
-    log(f"[VERIFY]   Pre-library remaining: {stats['prelib_remaining']} files")
-    log(f"[VERIFY]   Failed imports: {stats['failed_imports']} files")
-    
+        for pattern in AUDIO_GLOBS:
+            stats["failed_imports"] += len(list(failed_dir.glob(pattern)))
+
+    log("[VERIFY] Import Statistics:")
+    log("[VERIFY]   Library total:         %d files" % stats["library_total"])
+    log("[VERIFY]   Pre-library remaining: %d files" % stats["prelib_remaining"])
+    log("[VERIFY]   Failed imports:        %d files" % stats["failed_imports"])
+
     if stats["prelib_remaining"] > 0:
-        log(f"[VERIFY] WARNING: Files still in /pre-library - check if import worked correctly")
-    
+        log("[VERIFY] WARNING: Files still in /pre-library - check import log")
+
     return stats

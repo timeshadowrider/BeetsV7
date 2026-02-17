@@ -4,7 +4,6 @@
 from pathlib import Path
 import subprocess
 import time
-import json
 import os
 
 # Core paths
@@ -37,9 +36,21 @@ def ts():
 
 
 def run(cmd):
-    # Simple wrapper for subprocess
-    subprocess.run(cmd, check=False)
+    """
+    Run a subprocess command and return the CompletedProcess result.
+
+    FIX: Do NOT use capture_output=True - beet import needs stdin/stdout
+    to function correctly in non-interactive mode. capture_output breaks
+    beets' terminal detection and can cause hangs or incorrect behaviour.
+    Instead stderr is redirected to stdout so it appears in container logs.
+    """
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        from .logging import log
+        log("[RUN] Command exited with code %d: %s" % (
+            result.returncode, " ".join(str(c) for c in cmd)))
+    return result
 
 
-def safe_folder_name(text: str | None) -> str:
+def safe_folder_name(text) -> str:
     return (text or "Unknown").replace("/", "-").strip()

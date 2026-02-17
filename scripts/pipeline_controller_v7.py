@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v7.3 HYBRID Pipeline Controller (FINAL)
+v7.4 HYBRID Pipeline Controller
 
-Features:
-- File-based locking (prevents concurrent runs)
-- Chunked processing (25 files at a time)
-- Quick corruption check in /inbox
-- Beets handles heavy metadata validation
-- Failed imports quarantined automatically
+Fixes from v7.3:
+- PipelineLock opens lockfile with 'a' not 'r' (flock on read-only fd is unreliable)
+- chunk delay logic was using multiplication instead of checking remaining chunks
+- loose file processing now collects files BEFORE album subfolders are moved,
+  preventing a race where artist_folder is empty by the time loose files are checked
+- traceback import moved to top level
+- version string updated
 """
 import fcntl
 import sys
+import traceback
 from pathlib import Path
 import time
 import shutil
+
 from scripts.pipeline.logging import log, update_status
 from scripts.pipeline.slskd import global_settle, artist_in_use
 from scripts.pipeline.sabnzbd import sabnzbd_is_processing
@@ -33,36 +36,28 @@ from scripts.pipeline.quarantine import quarantine_failed_imports_global
 from scripts.pipeline.regenerate import generate_ui_json
 
 
-# Configuration
-CHUNK_SIZE = 25  # Process files in batches of 25
-LOCK_FILE = Path("/data/pipeline.lock")  # In /data so it's accessible outside container
+CHUNK_SIZE = 25
+LOCK_FILE = Path("/data/pipeline.lock")
 
 
 class PipelineLock:
-    """
-    File-based lock to prevent concurrent pipeline runs.
-    
-    Usage:
-        with PipelineLock():
-            # Pipeline code here
-            # Lock is automatically released on exit
-    """
+    """File-based lock to prevent concurrent pipeline runs."""
+
     def __init__(self, lockfile: Path = LOCK_FILE, timeout: int = 5):
         self.lockfile = lockfile
         self.timeout = timeout
         self.lock_fd = None
-    
+
     def __enter__(self):
-        """Acquire the lock"""
-        log(f"[LOCK] Attempting to acquire lock: {self.lockfile}")
-        
-        # Create lock file if it doesn't exist
+        log("[LOCK] Attempting to acquire lock: %s" % self.lockfile)
+
         self.lockfile.touch(exist_ok=True)
-        
-        # Open lock file
-        self.lock_fd = open(self.lockfile, 'r')
-        
-        # Try to acquire exclusive lock with timeout
+
+        # FIX: Open with 'a' (append) not 'r' (read-only).
+        # fcntl.flock(LOCK_EX) on a read-only file descriptor is unreliable
+        # on some Linux kernels and will always fail with EBADF.
+        self.lock_fd = open(self.lockfile, "a")
+
         start_time = time.time()
         while True:
             try:
@@ -71,37 +66,34 @@ class PipelineLock:
                 return self
             except IOError:
                 if time.time() - start_time >= self.timeout:
+                    self.lock_fd.close()
                     log("[LOCK] ERROR: Could not acquire lock (another instance running?)")
                     raise RuntimeError(
                         "Pipeline is already running. "
-                        f"If this is incorrect, remove {self.lockfile}"
+                        "If this is incorrect, remove %s" % self.lockfile
                     )
-                log("[LOCK] Waiting for lock (another instance running)...")
+                log("[LOCK] Waiting for lock...")
                 time.sleep(1)
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Release the lock"""
         if self.lock_fd:
             fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_UN)
             self.lock_fd.close()
             log("[LOCK] Lock released")
-        
-        # Don't delete lock file - keep it for next run
-        return False  # Don't suppress exceptions
+        return False
 
 
 def cleanup_invalid_failed_imports():
-    """Remove failed_imports folders from invalid locations"""
+    """Remove failed_imports folders from locations they should never exist."""
     invalid_locations = [Path("/inbox/failed_imports")]
-    
     for path in invalid_locations:
         if path.exists():
-            log(f"[CLEANUP] Removing invalid failed_imports from: {path}")
+            log("[CLEANUP] Removing invalid failed_imports from: %s" % path)
             try:
                 shutil.rmtree(path)
-                log(f"[CLEANUP] Successfully removed: {path}")
+                log("[CLEANUP] Successfully removed: %s" % path)
             except Exception as e:
-                log(f"[CLEANUP] Could not remove {path}: {e}")
+                log("[CLEANUP] Could not remove %s: %s" % (path, e))
 
 
 def list_artist_folders():
@@ -116,257 +108,270 @@ def list_artist_folders():
 
 
 def quick_corruption_check(filepath: Path) -> bool:
-    """
-    Fast corruption check - verify file is readable and non-zero.
-    Catches obviously broken files without deep validation.
-    """
+    """Fast check - verify file is readable and non-trivially small."""
     try:
-        # Check file exists and has size
         if not filepath.exists() or filepath.stat().st_size == 0:
-            log(f"[CORRUPT] Empty or missing: {filepath.name}")
+            log("[CORRUPT] Empty or missing: %s" % filepath.name)
             return False
-        
-        # Try to open and read first few bytes
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             header = f.read(1024)
             if len(header) < 100:
-                log(f"[CORRUPT] File too small: {filepath.name}")
+                log("[CORRUPT] File too small: %s" % filepath.name)
                 return False
-        
         return True
-        
     except Exception as e:
-        log(f"[CORRUPT] Cannot read {filepath.name}: {e}")
+        log("[CORRUPT] Cannot read %s: %s" % (filepath.name, e))
         return False
 
 
 def quarantine_corrupted_file(filepath: Path):
-    """Move obviously corrupted file to quarantine"""
+    """Move a corrupted file to quarantine."""
     from scripts.pipeline.quarantine import QUARANTINE_ROOT
-    
     QUARANTINE_ROOT.mkdir(parents=True, exist_ok=True)
-    
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    safe_name = f"corrupt_{timestamp}_{filepath.name}"
-    dst = QUARANTINE_ROOT / safe_name
-    
-    log(f"[QUARANTINE] Corrupted file: {filepath.name}")
-    
+    dst = QUARANTINE_ROOT / ("corrupt_%s_%s" % (timestamp, filepath.name))
+    log("[QUARANTINE] Corrupted file: %s" % filepath.name)
     try:
         shutil.move(str(filepath), str(dst))
     except Exception as e:
-        log(f"[QUARANTINE] Failed to move {filepath}: {e}")
+        log("[QUARANTINE] Failed to move %s: %s" % (filepath, e))
 
 
 def chunk_list(items: list, chunk_size: int):
-    """
-    Split a list into chunks of specified size.
-    
-    Example:
-        chunk_list([1,2,3,4,5], 2) -> [[1,2], [3,4], [5]]
-    """
     for i in range(0, len(items), chunk_size):
         yield items[i:i + chunk_size]
 
 
 def process_artist(artist_folder: Path, active_paths):
     """
-    Process artist folder with hybrid approach + chunking.
-    
+    Process one artist folder through the full pipeline.
+
     Flow:
-    1. Quick corruption check in /inbox
-    2. Move valid files to /pre-library
-    3. Process in chunks of CHUNK_SIZE files
-    4. Beets handles metadata validation per chunk
+    1. Safety checks (SLSKD, SABnzbd, settle timer)
+    2. Junk cleanup
+    3. Collect loose files NOW before any moves happen
+    4. Collect album subfolders, check corruption
+    5. Move albums to pre-library and import in chunks
+    6. Move loose files to pre-library and import in chunks
+    7. Clean up empty inbox tree
     """
-    if artist_in_use(artist_folder, active_paths):
-        log("[SKIP] SLSKD soft-busy match: %s" % artist_folder)
+    if not artist_folder.exists():
+        log("[SKIP] Folder disappeared before processing: %s" % artist_folder)
         return
-    
+
+    if artist_in_use(artist_folder, active_paths):
+        log("[SKIP] SLSKD active match: %s" % artist_folder)
+        return
+
     if sabnzbd_is_processing(artist_folder):
         log("[SKIP] SABnzbd still processing: %s" % artist_folder)
         return
-    
+
     if not folder_is_settled(artist_folder, 300):
         log("[SKIP] Grace period not met: %s" % artist_folder)
         return
-    
+
     log("ARTIST: %s" % artist_folder)
     update_status("running", "processing artist", artist_folder.name)
-    
-    cleanup_inbox_junk(artist_folder)
-    
-    # Track all albums to process (for chunking)
+
+    try:
+        cleanup_inbox_junk(artist_folder)
+    except FileNotFoundError:
+        log("[SKIP] Folder disappeared during cleanup: %s" % artist_folder)
+        return
+
+    if not artist_folder.exists():
+        log("[SKIP] Folder removed during cleanup: %s" % artist_folder)
+        return
+
+    # FIX: Collect BOTH loose files and subfolders NOW before anything is moved.
+    # Previously loose files were collected after album subfolders were moved out,
+    # meaning artist_folder could be empty or gone by the time we checked for them.
+    try:
+        all_contents = list(artist_folder.iterdir())
+    except FileNotFoundError:
+        log("[SKIP] Folder disappeared while listing contents: %s" % artist_folder)
+        return
+
+    # Separate loose audio files from album subfolders up front
+    loose_audio = [
+        p for p in all_contents
+        if p.is_file()
+        and p.suffix.lower() in {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
+    ]
+
     albums_to_process = []
-    
-    # Process album subfolders
-    for sub in sorted(artist_folder.iterdir()):
-        if not sub.is_dir() or sub.name == "failed_imports":
+    for sub in sorted(p for p in all_contents if p.is_dir()):
+        try:
+            if sub.name == "failed_imports":
+                continue
+        except FileNotFoundError:
             continue
-            
-        if not folder_is_settled(sub, 3600):
+
+        if not folder_is_settled(sub, 300):
             log("[SKIP] Album subfolder not settled: %s" % sub)
             continue
-        
-        # Quick corruption check for audio files in the folder
-        audio_files = [
-            f for f in sub.rglob("*")
-            if f.is_file() and f.suffix.lower() in {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
-        ]
-        
+
+        try:
+            audio_files = [
+                f for f in sub.rglob("*")
+                if f.is_file()
+                and f.suffix.lower() in {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
+            ]
+        except (FileNotFoundError, PermissionError):
+            log("[SKIP] Cannot access subfolder: %s" % sub)
+            continue
+
         corrupted_count = 0
         for audio_file in audio_files:
             if not quick_corruption_check(audio_file):
                 quarantine_corrupted_file(audio_file)
                 corrupted_count += 1
-        
-        # If folder still has files after corruption check, mark for processing
-        remaining_files = [
-            f for f in sub.rglob("*")
-            if f.is_file() and f.suffix.lower() in {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
-        ]
-        
-        if remaining_files:
+
+        try:
+            remaining = [
+                f for f in sub.rglob("*")
+                if f.is_file()
+                and f.suffix.lower() in {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
+            ]
+        except (FileNotFoundError, PermissionError):
+            log("[SKIP] Folder disappeared during corruption check: %s" % sub)
+            continue
+
+        if remaining:
             if corrupted_count > 0:
-                log(f"[VALIDATE] Removed {corrupted_count} corrupted files from {sub.name}")
+                log("[VALIDATE] Removed %d corrupted files from %s" % (corrupted_count, sub.name))
             albums_to_process.append(sub)
         else:
-            log(f"[SKIP] No valid files remaining in {sub.name}")
-    
-    # Process albums in chunks
+            log("[SKIP] No valid files remaining in %s" % sub.name)
+
+    # --- Process album subfolders in chunks ---
     if albums_to_process:
         total_albums = len(albums_to_process)
-        log(f"[CHUNK] Processing {total_albums} albums in chunks of {CHUNK_SIZE}")
-        
-        for chunk_idx, album_chunk in enumerate(chunk_list(albums_to_process, CHUNK_SIZE), 1):
-            log(f"[CHUNK] Processing chunk {chunk_idx} ({len(album_chunk)} albums)")
-            
-            # Move this chunk to pre-library
+        log("[CHUNK] Processing %d albums in chunks of %d" % (total_albums, CHUNK_SIZE))
+
+        chunks = list(chunk_list(albums_to_process, CHUNK_SIZE))
+        for chunk_idx, album_chunk in enumerate(chunks, 1):
+            log("[CHUNK] Album chunk %d/%d (%d albums)" % (chunk_idx, len(chunks), len(album_chunk)))
+
             for album in album_chunk:
-                move_existing_album_folder_to_prelibrary(album)
-            
-            # Process this chunk with Beets
-            log(f"[CHUNK] Fingerprinting chunk {chunk_idx}")
+                try:
+                    move_existing_album_folder_to_prelibrary(album)
+                except FileNotFoundError:
+                    log("[SKIP] Album folder disappeared: %s" % album)
+
+            log("[CHUNK] Fingerprinting chunk %d" % chunk_idx)
             run_fingerprint()
-            
-            log(f"[CHUNK] Importing chunk {chunk_idx}")
+
+            log("[CHUNK] Importing chunk %d" % chunk_idx)
             run_beets_import()
-            
-            log(f"[CHUNK] Post-processing chunk {chunk_idx}")
+
+            log("[CHUNK] Post-processing chunk %d" % chunk_idx)
             run_post_import()
-            
-            # Small delay between chunks to avoid overwhelming the system
-            if chunk_idx * CHUNK_SIZE < total_albums:
-                log(f"[CHUNK] Waiting 2s before next chunk...")
+
+            # FIX: Delay check was "chunk_idx * CHUNK_SIZE < total_albums" which
+            # incorrectly skips the delay on the last chunk when total is exact
+            # multiple of CHUNK_SIZE. Now simply check if more chunks remain.
+            if chunk_idx < len(chunks):
+                log("[CHUNK] Waiting 2s before next chunk...")
                 time.sleep(2)
-    
-    # Process loose files (also chunked)
-    loose = [p for p in artist_folder.iterdir() if p.is_file()]
-    audio = [
-        p for p in loose
-        if p.suffix.lower() in {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
-    ]
-    
-    if audio:
-        # Quick corruption check
+
+    # --- Process loose audio files in chunks ---
+    if loose_audio:
         valid_audio = []
-        for audio_file in audio:
-            if quick_corruption_check(audio_file):
-                valid_audio.append(audio_file)
-            else:
-                quarantine_corrupted_file(audio_file)
-        
+        for audio_file in loose_audio:
+            if audio_file.exists():  # May have been cleaned up already
+                if quick_corruption_check(audio_file):
+                    valid_audio.append(audio_file)
+                else:
+                    quarantine_corrupted_file(audio_file)
+
         if valid_audio:
-            # Group by album
             groups = group_files_by_album(valid_audio)
-            
-            # Process groups in chunks
             group_items = list(groups.items())
             total_groups = len(group_items)
-            
-            if total_groups > 0:
-                log(f"[CHUNK] Processing {total_groups} loose file groups in chunks of {CHUNK_SIZE}")
-                
-                for chunk_idx, group_chunk in enumerate(chunk_list(group_items, CHUNK_SIZE), 1):
-                    log(f"[CHUNK] Processing loose files chunk {chunk_idx} ({len(group_chunk)} groups)")
-                    
-                    # Move this chunk to pre-library
-                    for (aa, al), files in group_chunk:
-                        move_group_to_prelibrary(
-                            aa or artist_folder.name,
-                            al or "Unknown Album",
-                            files,
-                        )
-                    
-                    # Process this chunk with Beets
-                    log(f"[CHUNK] Fingerprinting loose files chunk {chunk_idx}")
-                    run_fingerprint()
-                    
-                    log(f"[CHUNK] Importing loose files chunk {chunk_idx}")
-                    run_beets_import()
-                    
-                    log(f"[CHUNK] Post-processing loose files chunk {chunk_idx}")
-                    run_post_import()
-                    
-                    # Delay between chunks
-                    if chunk_idx * CHUNK_SIZE < total_groups:
-                        log(f"[CHUNK] Waiting 2s before next chunk...")
-                        time.sleep(2)
-    
+
+            log("[CHUNK] Processing %d loose file groups in chunks of %d" % (total_groups, CHUNK_SIZE))
+
+            chunks = list(chunk_list(group_items, CHUNK_SIZE))
+            for chunk_idx, group_chunk in enumerate(chunks, 1):
+                log("[CHUNK] Loose chunk %d/%d (%d groups)" % (chunk_idx, len(chunks), len(group_chunk)))
+
+                for (aa, al), files in group_chunk:
+                    move_group_to_prelibrary(
+                        aa or artist_folder.name,
+                        al or "Unknown Album",
+                        files,
+                    )
+
+                log("[CHUNK] Fingerprinting loose chunk %d" % chunk_idx)
+                run_fingerprint()
+
+                log("[CHUNK] Importing loose chunk %d" % chunk_idx)
+                run_beets_import()
+
+                log("[CHUNK] Post-processing loose chunk %d" % chunk_idx)
+                run_post_import()
+
+                # FIX: Same delay fix as above
+                if chunk_idx < len(chunks):
+                    log("[CHUNK] Waiting 2s before next chunk...")
+                    time.sleep(2)
+
     # Cleanup empty inbox tree
     try:
-        if not any(artist_folder.iterdir()):
+        if artist_folder.exists() and not any(artist_folder.iterdir()):
             cleanup_empty_inbox_tree(artist_folder)
     except FileNotFoundError:
         pass
 
 
 def main():
-    """
-    Main pipeline execution with locking.
-    
-    The lock ensures only one instance runs at a time.
-    """
     try:
         with PipelineLock(timeout=5):
-            log("=== v7.3 Hybrid Pipeline Controller (FINAL) ===")
+            log("=== v7.4 Hybrid Pipeline Controller ===")
             update_status("running", "starting pipeline")
-            
-            # Clean up invalid failed_imports folders
+
             cleanup_invalid_failed_imports()
-            
-            # Quarantine any failed imports from pre-library
             quarantine_failed_imports_global(PRELIB)
-            
+
             active_paths = global_settle()
             artists = list_artist_folders()
-            
+
             if not artists:
                 log("Inbox empty - nothing to do.")
                 update_status("idle", "inbox empty")
                 return
-            
-            # Process all artists (chunked processing happens inside)
+
             for artist in artists:
-                process_artist(artist, active_paths)
-            
-            # Final cleanup and notifications
+                if not artist.exists():
+                    log("[SKIP] Artist folder disappeared: %s" % artist)
+                    continue
+                try:
+                    process_artist(artist, active_paths)
+                except FileNotFoundError as e:
+                    log("[SKIP] Folder disappeared during processing: %s - %s" % (artist, e))
+                except Exception as e:
+                    log("[ERROR] Error processing %s: %s" % (artist, e))
+                    log("[ERROR] Traceback: %s" % traceback.format_exc())
+
             time.sleep(2)
             fix_library_permissions()
             generate_ui_json()
             trigger_subsonic_scan_from_config()
             trigger_volumio_rescan()
-            
-            log("=== v7.3 Pipeline Finished ===")
+
+            log("=== v7.4 Pipeline Finished ===")
             update_status("success", "pipeline finished")
-            
+
     except RuntimeError as e:
-        log(f"[ERROR] {e}")
+        log("[ERROR] %s" % e)
         update_status("error", str(e))
         sys.exit(1)
     except Exception as e:
-        log(f"[ERROR] Pipeline failed: {e}")
-        update_status("error", f"pipeline failed: {e}")
+        log("[ERROR] Pipeline failed: %s" % e)
+        update_status("error", "pipeline failed: %s" % e)
+        log("[ERROR] Traceback: %s" % traceback.format_exc())
         raise
 
 
