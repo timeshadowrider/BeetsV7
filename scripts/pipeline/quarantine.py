@@ -11,6 +11,7 @@ Rules:
 - Never touch folders fuzzy-matched to active SLSKD transfers.
 - Never touch folders SABnzbd is still processing.
 - Never allow failed_imports to exist outside /music/quarantine.
+- Never scan /inbox for failed_imports (they shouldn't exist there).
 - Flatten quarantined files safely.
 """
 
@@ -127,12 +128,21 @@ def quarantine_failed_imports_global(root_path: Path):
     """
     Scan root_path for any folder named failed_imports.
     Apply full safety checks:
+    - skip /inbox entirely (failed_imports should never exist there)
     - skip _UNPACK_* (active downloads)
     - skip SABnzbd active jobs
     - skip SLSKD fuzzy matches
     - skip folders not settled (mtime)
     """
     if not root_path.exists():
+        return
+    
+    # SAFETY: Never scan /inbox for failed_imports
+    # Failed imports should only exist in /pre-library (temporarily)
+    # and /music/quarantine (permanently)
+    root_path_str = str(root_path.resolve())
+    if root_path_str.startswith("/inbox"):
+        qlog("SKIP: /inbox should never contain failed_imports folders")
         return
 
     qlog("Scanning for failed_imports under: %s" % root_path)

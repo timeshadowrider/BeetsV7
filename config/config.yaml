@@ -26,7 +26,7 @@ import:
   copy: no
   write: yes
   log: /data/last_beets_imports.log
-  quiet_fallback: asis
+  quiet_fallback: skip
   detail: yes
   duplicate_action: skip
   timid: no
