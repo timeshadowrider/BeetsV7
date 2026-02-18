@@ -1,12 +1,5 @@
 # ============================================================================
 # BEETS CONFIGURATION - v7.5
-# Key changes from v7.4:
-# - singleton: no  (was: yes) -- CRITICAL FIX: was treating every file as a
-#   standalone single, destroying album matching
-# - fingerprint: no (was: yes) -- redundant, fingerprint_all.py already does this
-# - incremental: yes (was: no) -- track processed files to avoid re-scanning
-# - inline fields renamed to albumartist_clean/artist_clean -- prevents
-#   mangling real tags during MusicBrainz matching
 # ============================================================================
 
 directory: /music/library
@@ -18,7 +11,6 @@ ui:
 asciify_paths: no
 per_disc_numbering: no
 threaded: yes
-original_date: yes
 
 paths:
   default: $albumartist/($year) $album%if{$albumdisambig, [$albumdisambig]}/$track $title
@@ -29,7 +21,7 @@ paths:
 # IMPORT SETTINGS
 # ----------------------------------------------------------------------------
 import:
-  incremental: yes      # was: no -- now tracks processed files, avoids re-scanning
+  incremental: yes
   move: yes
   copy: no
   write: yes
@@ -38,17 +30,13 @@ import:
   duplicate_action: skip
   timid: no
   autotag: yes
-  fingerprint: no       # was: yes -- redundant, fingerprint_all.py handles this
-                        # and double-fingerprinting causes AcoustID rate-limit failures
+  fingerprint: yes      # Uses chroma plugin (chromaprint) for AcoustID lookup
+                        # Identifies recordings by audio fingerprint so
+                        # compilations/remasters with bad tags still match
   art: yes
   group_albums: yes
   resume: no
-  singleton: no         # was: yes -- CRITICAL FIX. 'yes' treated every file as a
-                        # standalone single, bypassing album matching entirely.
-                        # This was the primary cause of failed_imports.
-
-  # KEY FIXES - was 'skip', now 'asis'
-  # 'asis' imports with existing file tags rather than abandoning to failed_imports
+  singleton: no
   quiet_fallback: asis
   none_rec_action: asis
 
@@ -57,10 +45,7 @@ import:
 # ----------------------------------------------------------------------------
 match:
   unmatched_tracks: keep
-
-  # Lowered from 0.25 to 0.10 - less strict, fewer false failures
   strong_rec_thresh: 0.10
-
   distance_weights:
     track_title: 1.0
     track_artist: 1.0
@@ -85,6 +70,11 @@ logging:
 
 # ----------------------------------------------------------------------------
 # PLUGINS
+# Note: subsonicupdate removed -- Navidrome scan is triggered directly via
+#       API call in system_hooks.py (trigger_subsonic_scan_from_config)
+# Note: chroma added -- provides AcoustID fingerprinting via chromaprint.
+#       Requires chromaprint/fpcalc to be installed in the container.
+#       Check with: docker exec beetsV7 fpcalc -version
 # ----------------------------------------------------------------------------
 plugins:
   - info
@@ -99,6 +89,7 @@ plugins:
   - ftintitle
   - lastgenre
   - albumtypes
+  - chroma
   - discogs
   - musicbrainz
   - lyrics
@@ -109,12 +100,22 @@ plugins:
   - smartplaylist
 
 # ----------------------------------------------------------------------------
+# CHROMA (AcoustID fingerprinting)
+# Requires a free API key from https://acoustid.org/api-key
+# Without this key fingerprint: yes silently does nothing useful
+# ----------------------------------------------------------------------------
+chroma:
+  auto: yes
+
+acoustid:
+  apikey: ToQiZOt39C
+
+# ----------------------------------------------------------------------------
 # INLINE METADATA NORMALIZATION
-# FIX: Renamed from 'albumartist'/'artist' to 'albumartist_clean'/'artist_clean'
-# Previously these shadowed the real tags during MusicBrainz matching, causing
-# collaborative artists like "Simon & Garfunkel" to be looked up as just "Simon".
-# The _clean variants are available for path templates or display but do NOT
-# interfere with the import matching pipeline.
+# Named albumartist_clean/artist_clean NOT albumartist/artist.
+# Using the real field names shadows actual tags during MusicBrainz matching
+# causing collaborative artists like "Simon & Garfunkel" to be looked up
+# as just "Simon" and fail to find a match.
 # ----------------------------------------------------------------------------
 inline:
   albumartist_clean: |
@@ -205,16 +206,6 @@ plex:
   host: 10.0.0.100
   port: 32400
   token: rEn12-HUTx1TsfYDyDpz
-
-# ----------------------------------------------------------------------------
-# SUBSONIC (disabled)
-# ----------------------------------------------------------------------------
-#subsonic:
-#  host: http://10.0.0.100
-#  port: 4533
-#  user: timeshadowrider
-#  pass: 'An|t@theR@bb|t'
-#  contextpath: /
 
 # ----------------------------------------------------------------------------
 # SMART PLAYLISTS
