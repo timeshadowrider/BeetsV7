@@ -7,7 +7,9 @@ export function useLibraryStats() {
     queryFn: async () => {
       const { data } = await api.get("/ui/stats/library");
       return data;
-    }
+    },
+    refetchInterval: 30_000,   // re-fetch every 30s
+    staleTime: 10_000
   });
 }
 
@@ -17,7 +19,9 @@ export function useInboxStats() {
     queryFn: async () => {
       const { data } = await api.get("/ui/stats/inbox");
       return data;
-    }
+    },
+    refetchInterval: 30_000,
+    staleTime: 10_000
   });
 }
 
@@ -27,7 +31,9 @@ export function useRecentAlbums() {
     queryFn: async () => {
       const { data } = await api.get("/ui/albums/recent");
       return data as any[];
-    }
+    },
+    refetchInterval: 60_000,
+    staleTime: 30_000
   });
 }
 
@@ -71,7 +77,7 @@ export function usePipelineStatus() {
   return useQuery({
     queryKey: ["pipeline", "status"],
     queryFn: async () => {
-      const { data } = await api.get("/status"); // adjust if you expose pipeline_status.json
+      const { data } = await api.get("/status");
       return data;
     },
     enabled: false

@@ -170,18 +170,6 @@ def scrub_metadata():
     )
 
 
-def update_albumtypes():
-    """Update album type metadata."""
-    logger.info("=" * 60)
-    logger.info("UPDATING ALBUM TYPES")
-    logger.info("=" * 60)
-    
-    run_beet_command(
-        "beet albumtypes",
-        "Update album type metadata"
-    )
-
-
 def generate_smart_playlists():
     """Generate smart playlists based on queries."""
     logger.info("=" * 60)
@@ -224,26 +212,27 @@ def run_full_refresh():
     
     Order of operations:
     1. Sync with MusicBrainz (get latest metadata)
-    2. Update album types
-    3. Fetch missing artwork
-    4. Embed artwork into files
-    5. Fetch missing lyrics
-    6. Update genres
-    7. Scrub/clean metadata
-    8. Generate smart playlists
-    9. Notify media servers (Plex, MPD)
+    2. Fetch missing artwork
+    3. Embed artwork into files
+    4. Fetch missing lyrics
+    5. Update genres
+    6. Scrub/clean metadata
+    7. Generate smart playlists
+    8. Notify media servers (Plex, MPD)
+    
+    Note: albumtypes plugin runs automatically during import, not as a standalone command.
     """
     start_time = time.time()
     
-    logger.info("+" + "=" * 58 + "+")
-    logger.info("�" + " " * 10 + "BEETS METADATA REFRESH STARTED" + " " * 17 + "�")
-    logger.info("�" + f" Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}" + " " * 30 + "�")
-    logger.info("+" + "=" * 58 + "+")
+    logger.info("╔" + "═" * 58 + "╗")
+    logger.info("║" + " " * 10 + "BEETS METADATA REFRESH STARTED" + " " * 17 + "║")
+    logger.info("║" + f" Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}" + " " * 30 + "║")
+    logger.info("╚" + "═" * 58 + "╝")
     
     # Phase 1: Metadata Updates
     logger.info("\n>>> PHASE 1: METADATA UPDATES <<<\n")
     sync_musicbrainz()
-    update_albumtypes()
+    # Note: albumtypes runs automatically during import, not as a standalone command
     
     # Phase 2: Artwork
     logger.info("\n>>> PHASE 2: ARTWORK <<<\n")
@@ -267,11 +256,11 @@ def run_full_refresh():
     
     # Summary
     elapsed = time.time() - start_time
-    logger.info("+" + "=" * 58 + "+")
-    logger.info("�" + " " * 10 + "METADATA REFRESH COMPLETED" + " " * 21 + "�")
-    logger.info("�" + f" Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}" + " " * 28 + "�")
-    logger.info("�" + f" Total time: {elapsed / 60:.1f} minutes" + " " * 34 + "�")
-    logger.info("+" + "=" * 58 + "+")
+    logger.info("╔" + "═" * 58 + "╗")
+    logger.info("║" + " " * 10 + "METADATA REFRESH COMPLETED" + " " * 21 + "║")
+    logger.info("║" + f" Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}" + " " * 28 + "║")
+    logger.info("║" + f" Total time: {elapsed / 60:.1f} minutes" + " " * 34 + "║")
+    logger.info("╚" + "═" * 58 + "╝")
 
 
 def run_quick_refresh():

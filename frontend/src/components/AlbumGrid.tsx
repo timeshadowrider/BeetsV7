@@ -15,9 +15,9 @@ export default function AlbumGrid({
 }) {
   return (
     <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
-      {albums.map((a, i) => (
+      {albums.map((a) => (
         <AlbumCard
-          key={i}
+          key={`${a.albumartist}::${a.album}`}
           album={a}
           onClick={onSelect ? () => onSelect(a) : undefined}
         />

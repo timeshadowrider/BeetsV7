@@ -18,11 +18,9 @@ AUDIO_GLOBS = ["**/*.flac", "**/*.mp3", "**/*.m4a", "**/*.ogg", "**/*.wav", "**/
 def run_fingerprint():
     """Run AcoustID fingerprinting on all files in /pre-library."""
     vlog("[FP] Running fingerprint pass...")
-
     if not PRELIB.exists() or not any(PRELIB.iterdir()):
         vlog("[FP] No files in /pre-library to fingerprint")
         return
-
     try:
         run(["python3", "/app/scripts/fingerprint_all.py"])
         vlog("[FP] Fingerprinting completed")
@@ -33,16 +31,13 @@ def run_fingerprint():
 def run_beets_import():
     """
     Import files from /pre-library to /music/library.
-
     Uses --quiet so Beets is non-interactive but still respects
     quiet_fallback and none_rec_action from config.yaml (set to 'asis').
     """
     vlog("[BEETS] Importing pre-library...")
-
     if not PRELIB.exists() or not any(PRELIB.iterdir()):
         vlog("[BEETS] No files in /pre-library to import")
         return
-
     try:
         run(["beet", "import", "--quiet", str(PRELIB)])
         vlog("[BEETS] Import completed")
@@ -70,16 +65,12 @@ def run_beets_import():
 def run_post_import():
     """Post-import updates scoped to recently added files only."""
     vlog("[BEETS] Post-import update/move...")
-
     try:
         vlog("[BEETS] Updating recently imported files...")
         run(["beet", "update", "added:-1h.."])
-
         vlog("[BEETS] Ensuring files are in correct location...")
         run(["beet", "move", "added:-1h.."])
-
         vlog("[BEETS] Post-import completed")
-
     except Exception as e:
         log("[BEETS] Post-import warning: %s" % e)
 
@@ -118,3 +109,11 @@ def verify_import_success():
         log("[VERIFY] WARNING: Files still in /pre-library - check import log")
 
     return stats
+
+
+if __name__ == "__main__":
+    log("[BEETS] Running beets module directly...")
+    run_fingerprint()
+    run_beets_import()
+    run_post_import()
+    log("[BEETS] Done.")

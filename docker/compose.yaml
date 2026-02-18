@@ -6,7 +6,12 @@ services:
     container_name: beetsV7
     restart: unless-stopped
 
-    # Put beets on the same network as Navidrome
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+
     networks:
       - media-bridge
 
@@ -21,6 +26,9 @@ services:
       INBOX_DIR: /inbox
       VOLUMIO_URL: "http://10.0.0.102"
       VOLUMIO_MUSIC_MOUNT: "INTERNAL"
+      TZ: America/Los_Angeles
+      PUID: 1000
+      PGID: 1000
 
     user: "1000:1000"
 
@@ -42,6 +50,9 @@ services:
       # backend + scripts
       - ../backend:/app/backend:rw
       - ../scripts:/app/scripts:rw
+
+      # timezone sync (optional but recommended)
+      - /etc/localtime:/etc/localtime:ro
 
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:7080/api/stats || exit 1"]
