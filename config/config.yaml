@@ -1,11 +1,11 @@
 # ============================================================================
 # BEETS CONFIGURATION - v7.5
 # Key changes from v7.4:
-# - singleton: no  (was: yes) — CRITICAL FIX: was treating every file as a
+# - singleton: no  (was: yes) -- CRITICAL FIX: was treating every file as a
 #   standalone single, destroying album matching
-# - fingerprint: no (was: yes) — redundant, fingerprint_all.py already does this
-# - incremental: yes (was: no) — track processed files to avoid re-scanning
-# - inline fields renamed to albumartist_clean/artist_clean — prevents
+# - fingerprint: no (was: yes) -- redundant, fingerprint_all.py already does this
+# - incremental: yes (was: no) -- track processed files to avoid re-scanning
+# - inline fields renamed to albumartist_clean/artist_clean -- prevents
 #   mangling real tags during MusicBrainz matching
 # ============================================================================
 
@@ -29,7 +29,7 @@ paths:
 # IMPORT SETTINGS
 # ----------------------------------------------------------------------------
 import:
-  incremental: yes      # was: no — now tracks processed files, avoids re-scanning
+  incremental: yes      # was: no -- now tracks processed files, avoids re-scanning
   move: yes
   copy: no
   write: yes
@@ -38,12 +38,12 @@ import:
   duplicate_action: skip
   timid: no
   autotag: yes
-  fingerprint: no       # was: yes — redundant, fingerprint_all.py handles this
+  fingerprint: no       # was: yes -- redundant, fingerprint_all.py handles this
                         # and double-fingerprinting causes AcoustID rate-limit failures
   art: yes
   group_albums: yes
   resume: no
-  singleton: no         # was: yes — CRITICAL FIX. 'yes' treated every file as a
+  singleton: no         # was: yes -- CRITICAL FIX. 'yes' treated every file as a
                         # standalone single, bypassing album matching entirely.
                         # This was the primary cause of failed_imports.
 

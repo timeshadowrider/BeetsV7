@@ -3,19 +3,31 @@
 
 import re
 
-# FIX: Removed short common words like "or", "at", "by", "as", "is", "it"
-# from stopwords. These can be meaningful parts of artist/album names
-# e.g. "The Band Perry", "At The Drive-In", "Is This It".
-# Only filter truly meaningless filler words.
+# Stopwords filtered out before matching.
+# Keep this list small -- only truly meaningless filler words.
+# Short words like "or", "at", "by" can be meaningful in artist/album names.
 STOPWORDS = {
     "a", "an", "the", "and", "with", "from", "this", "that",
 }
+
+# Pure numeric tokens (track numbers, years used as folder prefixes, etc.)
+# should never match against artist/album folder names. A folder called
+# "Alabama-40.Hour.Week" contains "40" as a word token; a transfer path
+# "04 Don't Look Back in Anger.flac" contains "04". These should NOT match.
+# We filter out any token that is purely digits or zero-padded digits.
+def _is_numeric(token: str) -> bool:
+    return token.isdigit()
 
 
 def tokenize(text: str):
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
-    tokens = [t for t in text.split() if t and t not in STOPWORDS]
+    tokens = [
+        t for t in text.split()
+        if t
+        and t not in STOPWORDS
+        and not _is_numeric(t)   # FIX: drop pure numeric tokens (track numbers, years)
+    ]
     return tokens
 
 
@@ -23,10 +35,13 @@ def fuzzy_match(path_tokens, folder_tokens):
     """
     Returns True if ANY token from path_tokens appears in folder_tokens.
 
-    FIX: This is a very broad match - a single shared token triggers it.
-    This is intentional for safety (better to skip a folder than process
-    one mid-download) but means common words in artist names can cause
-    false positives. The reduced stopword list above reduces this risk.
+    FIX: Numeric-only tokens are now stripped in tokenize() so track numbers
+    like "03", "04", "10" in SLSKD transfer paths can no longer cause false
+    positive matches against inbox folder names that happen to contain the
+    same digits (e.g. "Alabama-40.Hour.Week", "10 Great Songs", "04 - Holy...").
+
+    This was causing almost every inbox folder to be incorrectly flagged as
+    matching the active Oasis download and skipped by the pipeline.
     """
     if not path_tokens or not folder_tokens:
         return False

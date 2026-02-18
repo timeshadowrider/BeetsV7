@@ -21,7 +21,7 @@ import time
 import shutil
 
 from scripts.pipeline.logging import log, update_status
-from scripts.pipeline.slskd import global_settle, artist_in_use, slskd_active_transfers
+from scripts.pipeline.slskd import artist_in_use, slskd_active_transfers
 from scripts.pipeline.sabnzbd import sabnzbd_is_processing
 from scripts.pipeline.settle import folder_is_settled
 from scripts.pipeline.cleanup import cleanup_inbox_junk, cleanup_empty_inbox_tree
@@ -386,8 +386,25 @@ def main():
             cleanup_invalid_failed_imports()
             quarantine_failed_imports_global(PRELIB)
 
-            # Initial gate: wait for SLSKD to go fully idle before starting
-            global_settle()
+            # FIX: Removed global_settle() as a hard gate. Previously the pipeline
+            # would block until ALL SLSKD transfers finished (threshold=0), meaning
+            # if you had 15 active downloads it would wait 30s between each check
+            # until the queue was completely empty -- potentially hours.
+            #
+            # This was unnecessary because process_artist() already does a
+            # per-artist artist_in_use() check using fuzzy matching against active
+            # transfer paths. Artists with no active downloads are safe to process
+            # immediately. We just need the current transfer list as a reference,
+            # not a guarantee the entire queue is empty.
+            #
+            # active_paths is refreshed per-artist inside the loop below so it
+            # stays current as downloads complete during a long pipeline run.
+            log("[SLSKD] Fetching active transfers (non-blocking)...")
+            active_paths_initial = slskd_active_transfers()
+            if active_paths_initial:
+                log("[SLSKD] %d active/queued transfers -- will skip matching artists, process the rest" % len(active_paths_initial))
+            else:
+                log("[SLSKD] No active transfers")
 
             artists = list_artist_folders()
 
