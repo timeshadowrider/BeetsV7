@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-02-17 18:54:32",
-  "status": "running",
-  "detail": "processing artist",
-  "current_artist": "MOB CHOIR"
+  "timestamp": "2026-02-17 19:15:10",
+  "status": "error",
+  "detail": "Pipeline is already running. If this is incorrect, remove /data/pipeline.lock",
+  "current_artist": ""
 }

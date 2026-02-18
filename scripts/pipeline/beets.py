@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Beets Integration Module - v7.4
+Beets Integration Module - v7.5
+
+Changes from v7.4:
+- run_beets_import: added --log flag so beets writes per-import rejection
+  reasons to /data/last_beets_imports.log (separate from pipeline.log)
+- run_post_import: broadened 'added:-1h..' to 'added:-24h..' so imports
+  that take longer than one hour are still caught by the update/move pass
+- verify_import_success: now also warns when failed_imports count > 0,
+  and points to BEETS_IMPORT_LOG for diagnosis
 """
 from .util import run, PRELIB, LIBRARY
 from .logging import vlog, log
@@ -13,6 +21,10 @@ AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}
 
 # Glob patterns used only where Path.glob() is called
 AUDIO_GLOBS = ["**/*.flac", "**/*.mp3", "**/*.m4a", "**/*.ogg", "**/*.wav", "**/*.aac"]
+
+# Import log -- beets writes per-album rejection reasons here, separate from pipeline.log.
+# Check this file first when diagnosing why albums end up in failed_imports.
+BEETS_IMPORT_LOG = "/data/last_beets_imports.log"
 
 
 def run_fingerprint():
@@ -33,13 +45,18 @@ def run_beets_import():
     Import files from /pre-library to /music/library.
     Uses --quiet so Beets is non-interactive but still respects
     quiet_fallback and none_rec_action from config.yaml (set to 'asis').
+
+    FIX: Added --log flag so beets writes per-album rejection reasons to
+    /data/last_beets_imports.log. Without this, failed imports are silent
+    in pipeline.log -- you can see counts via verify_import_success() but
+    not the actual cause (duplicate, no match, below threshold, etc.).
     """
     vlog("[BEETS] Importing pre-library...")
     if not PRELIB.exists() or not any(PRELIB.iterdir()):
         vlog("[BEETS] No files in /pre-library to import")
         return
     try:
-        run(["beet", "import", "--quiet", str(PRELIB)])
+        run(["beet", "import", "--quiet", "--log=%s" % BEETS_IMPORT_LOG, str(PRELIB)])
         vlog("[BEETS] Import completed")
 
         # Diagnostic: log any files still in /pre-library (outside failed_imports)
@@ -63,13 +80,21 @@ def run_beets_import():
 
 
 def run_post_import():
-    """Post-import updates scoped to recently added files only."""
+    """
+    Post-import updates scoped to recently added files.
+
+    FIX: Broadened query from 'added:-1h..' to 'added:-24h..' to catch
+    imports from long-running sessions that exceed the 1-hour window.
+    A large import batch (hundreds of albums) can easily take 2-4 hours,
+    meaning everything before the last hour was silently missing the
+    update/move pass and left with incorrect paths or stale metadata.
+    """
     vlog("[BEETS] Post-import update/move...")
     try:
-        vlog("[BEETS] Updating recently imported files...")
-        run(["beet", "update", "added:-1h.."])
-        vlog("[BEETS] Ensuring files are in correct location...")
-        run(["beet", "move", "added:-1h.."])
+        vlog("[BEETS] Updating recently imported files (24h window)...")
+        run(["beet", "update", "added:-24h.."])
+        vlog("[BEETS] Ensuring files are in correct location (24h window)...")
+        run(["beet", "move", "added:-24h.."])
         vlog("[BEETS] Post-import completed")
     except Exception as e:
         log("[BEETS] Post-import warning: %s" % e)
@@ -106,7 +131,11 @@ def verify_import_success():
     log("[VERIFY]   Failed imports:        %d files" % stats["failed_imports"])
 
     if stats["prelib_remaining"] > 0:
-        log("[VERIFY] WARNING: Files still in /pre-library - check import log")
+        log("[VERIFY] WARNING: Files still in /pre-library - check %s" % BEETS_IMPORT_LOG)
+
+    if stats["failed_imports"] > 0:
+        log("[VERIFY] WARNING: %d files in failed_imports - check %s" % (
+            stats["failed_imports"], BEETS_IMPORT_LOG))
 
     return stats
 

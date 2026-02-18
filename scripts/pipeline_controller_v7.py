@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v7.4 HYBRID Pipeline Controller
+v7.5 HYBRID Pipeline Controller
 
-Fixes from v7.3:
-- PipelineLock opens lockfile with 'a' not 'r' (flock on read-only fd is unreliable)
-- chunk delay logic was using multiplication instead of checking remaining chunks
-- loose file processing now collects files BEFORE album subfolders are moved,
-  preventing a race where artist_folder is empty by the time loose files are checked
-- traceback import moved to top level
-- version string updated
+Changes from v7.4:
+- active_paths is now refreshed per-artist instead of captured once at startup.
+  Previously a single snapshot was taken before the artist loop began. If SLSKD
+  started a new download mid-run, the stale snapshot would not catch it, meaning
+  a partially-downloaded folder could be moved to pre-library and fail to import.
+- global_settle() still runs at startup as a gate, but slskd_active_transfers()
+  is called again before each individual artist is processed.
 """
 import fcntl
+import os
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -19,7 +21,7 @@ import time
 import shutil
 
 from scripts.pipeline.logging import log, update_status
-from scripts.pipeline.slskd import global_settle, artist_in_use
+from scripts.pipeline.slskd import global_settle, artist_in_use, slskd_active_transfers
 from scripts.pipeline.sabnzbd import sabnzbd_is_processing
 from scripts.pipeline.settle import folder_is_settled
 from scripts.pipeline.cleanup import cleanup_inbox_junk, cleanup_empty_inbox_tree
@@ -58,6 +60,11 @@ class PipelineLock:
         # on some Linux kernels and will always fail with EBADF.
         self.lock_fd = open(self.lockfile, "a")
 
+        # FIX: Auto-clear stale lock left behind by a container restart.
+        # A restarted container will never have a live process holding the lock,
+        # so if we can't acquire it within the timeout it must be stale.
+        # We attempt a non-blocking lock first; if it fails we check whether
+        # any pipeline process is actually running before giving up.
         start_time = time.time()
         while True:
             try:
@@ -66,6 +73,27 @@ class PipelineLock:
                 return self
             except IOError:
                 if time.time() - start_time >= self.timeout:
+                    # Check if a pipeline process is actually alive
+                    try:
+                        check = subprocess.run(
+                            ["pgrep", "-f", "pipeline_controller_v7.py"],
+                            capture_output=True, text=True
+                        )
+                        # pgrep returns our own PID too, so filter it out
+                        pids = [p for p in check.stdout.strip().splitlines()
+                                if p.strip() != str(os.getpid())]
+                        if not pids:
+                            # No other pipeline process running -- stale lock
+                            log("[LOCK] Stale lock detected (no live process). Clearing.")
+                            self.lock_fd.close()
+                            self.lockfile.unlink(missing_ok=True)
+                            self.lockfile.touch(exist_ok=True)
+                            self.lock_fd = open(self.lockfile, "a")
+                            start_time = time.time()
+                            continue
+                    except Exception as e:
+                        log("[LOCK] Could not check for live process: %s" % e)
+
                     self.lock_fd.close()
                     log("[LOCK] ERROR: Could not acquire lock (another instance running?)")
                     raise RuntimeError(
@@ -84,16 +112,39 @@ class PipelineLock:
 
 
 def cleanup_invalid_failed_imports():
-    """Remove failed_imports folders from locations they should never exist."""
+    """
+    Remove failed_imports folders from locations they should never exist.
+
+    FIX: shutil.rmtree fails with Permission denied if any file inside is
+    read-only or owned by a different user. We chmod everything writable
+    first. If chmod fails we log and attempt removal anyway.
+    """
     invalid_locations = [Path("/inbox/failed_imports")]
     for path in invalid_locations:
-        if path.exists():
-            log("[CLEANUP] Removing invalid failed_imports from: %s" % path)
-            try:
-                shutil.rmtree(path)
-                log("[CLEANUP] Successfully removed: %s" % path)
-            except Exception as e:
-                log("[CLEANUP] Could not remove %s: %s" % (path, e))
+        if not path.exists():
+            continue
+
+        log("[CLEANUP] Removing invalid failed_imports from: %s" % path)
+
+        # Make everything writable before rmtree
+        for root, dirs, files in os.walk(str(path)):
+            for d in dirs:
+                try:
+                    os.chmod(os.path.join(root, d), 0o755)
+                except Exception:
+                    pass
+            for f in files:
+                try:
+                    os.chmod(os.path.join(root, f), 0o644)
+                except Exception as e:
+                    log("[CLEANUP] Cannot chmod %s: %s -- will attempt removal anyway" % (f, e))
+
+        try:
+            shutil.rmtree(path)
+            log("[CLEANUP] Successfully removed: %s" % path)
+        except Exception as e:
+            log("[CLEANUP] Could not remove %s: %s" % (path, e))
+            log("[CLEANUP] Fix manually: docker exec beetsV7 rm -rf /inbox/failed_imports")
 
 
 def list_artist_folders():
@@ -329,13 +380,15 @@ def process_artist(artist_folder: Path, active_paths):
 def main():
     try:
         with PipelineLock(timeout=5):
-            log("=== v7.4 Hybrid Pipeline Controller ===")
+            log("=== v7.5 Hybrid Pipeline Controller ===")
             update_status("running", "starting pipeline")
 
             cleanup_invalid_failed_imports()
             quarantine_failed_imports_global(PRELIB)
 
-            active_paths = global_settle()
+            # Initial gate: wait for SLSKD to go fully idle before starting
+            global_settle()
+
             artists = list_artist_folders()
 
             if not artists:
@@ -347,6 +400,13 @@ def main():
                 if not artist.exists():
                     log("[SKIP] Artist folder disappeared: %s" % artist)
                     continue
+
+                # FIX: Refresh active transfer list per-artist rather than using
+                # a stale snapshot captured once before the loop. A download that
+                # starts mid-run would not appear in the original snapshot, meaning
+                # a partially-downloaded folder could be processed incorrectly.
+                active_paths = slskd_active_transfers()
+
                 try:
                     process_artist(artist, active_paths)
                 except FileNotFoundError as e:
@@ -361,7 +421,7 @@ def main():
             trigger_subsonic_scan_from_config()
             trigger_volumio_rescan()
 
-            log("=== v7.4 Pipeline Finished ===")
+            log("=== v7.5 Pipeline Finished ===")
             update_status("success", "pipeline finished")
 
     except RuntimeError as e:

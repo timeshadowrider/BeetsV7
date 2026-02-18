@@ -1,10 +1,12 @@
 # ============================================================================
-# BEETS CONFIGURATION - v7.4
-# Key changes from v7.3:
-# - quiet_fallback: asis  (was: skip) - imports with existing tags if no match
-# - none_rec_action: asis (was: skip) - same for zero-confidence matches
-# - strong_rec_thresh: 0.10 (was: 0.25) - more lenient matching
-# - original_date: yes - use original release year in $original_year field
+# BEETS CONFIGURATION - v7.5
+# Key changes from v7.4:
+# - singleton: no  (was: yes) — CRITICAL FIX: was treating every file as a
+#   standalone single, destroying album matching
+# - fingerprint: no (was: yes) — redundant, fingerprint_all.py already does this
+# - incremental: yes (was: no) — track processed files to avoid re-scanning
+# - inline fields renamed to albumartist_clean/artist_clean — prevents
+#   mangling real tags during MusicBrainz matching
 # ============================================================================
 
 directory: /music/library
@@ -27,7 +29,7 @@ paths:
 # IMPORT SETTINGS
 # ----------------------------------------------------------------------------
 import:
-  incremental: no
+  incremental: yes      # was: no — now tracks processed files, avoids re-scanning
   move: yes
   copy: no
   write: yes
@@ -36,11 +38,14 @@ import:
   duplicate_action: skip
   timid: no
   autotag: yes
-  fingerprint: yes
+  fingerprint: no       # was: yes — redundant, fingerprint_all.py handles this
+                        # and double-fingerprinting causes AcoustID rate-limit failures
   art: yes
   group_albums: yes
   resume: no
-  singleton: yes
+  singleton: no         # was: yes — CRITICAL FIX. 'yes' treated every file as a
+                        # standalone single, bypassing album matching entirely.
+                        # This was the primary cause of failed_imports.
 
   # KEY FIXES - was 'skip', now 'asis'
   # 'asis' imports with existing file tags rather than abandoning to failed_imports
@@ -105,9 +110,14 @@ plugins:
 
 # ----------------------------------------------------------------------------
 # INLINE METADATA NORMALIZATION
+# FIX: Renamed from 'albumartist'/'artist' to 'albumartist_clean'/'artist_clean'
+# Previously these shadowed the real tags during MusicBrainz matching, causing
+# collaborative artists like "Simon & Garfunkel" to be looked up as just "Simon".
+# The _clean variants are available for path templates or display but do NOT
+# interfere with the import matching pipeline.
 # ----------------------------------------------------------------------------
 inline:
-  albumartist: |
+  albumartist_clean: |
     import re
     normalized = re.sub(
         r'\s*(?:&|and|x|X|feat\.?|ft\.?|featuring|with|vs\.?)\s*',
@@ -117,7 +127,7 @@ inline:
     )
     return normalized.split('|||')[0].strip()
 
-  artist: |
+  artist_clean: |
     import re
     normalized = re.sub(
         r'\s*(?:&|and|x|X|feat\.?|ft\.?|featuring|with|vs\.?)\s*',
