@@ -17,6 +17,13 @@ paths:
   singleton: Non-Album/$artist/($year) Singles/$title
   comp: Compilations/($year) $album%if{$albumdisambig, [$albumdisambig]}/$track $title
 
+# Add this to config.yaml
+item_fields:
+  albumartist_primary: ""
+
+album_fields:
+  albumartist_primary: ""
+
 # ----------------------------------------------------------------------------
 # IMPORT SETTINGS
 # ----------------------------------------------------------------------------

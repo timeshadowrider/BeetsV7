@@ -7,6 +7,7 @@ Includes:
 - Metadata watcher
 - Metadata refresh scheduler
 - Discogs format tag refresh scheduler
+- Regenerate scheduler (keeps albums.json / stats.json fresh)
 """
 
 from fastapi import FastAPI
@@ -25,6 +26,7 @@ from backend.services.watcher_service import start_inbox_settle_watcher
 from backend.services.pipeline_scheduler import get_scheduler
 from backend.services.metadata_refresh_scheduler import get_metadata_scheduler
 from backend.services.discogs_refresh_scheduler import get_discogs_scheduler
+from backend.services.regenerate_scheduler import get_regenerate_scheduler
 
 # Configure logging
 logging.basicConfig(
@@ -64,7 +66,7 @@ async def lifespan(app: FastAPI):
     Starts all watchers and schedulers on startup, stops them on shutdown.
     """
     # STARTUP
-    logger.info("?? Starting BeetsV7 Backend v7.4...")
+    logger.info("🚀 Starting BeetsV7 Backend v7.5...")
 
     # 1. Start inbox settle watcher
     logger.info("[STARTUP] Starting inbox settle watcher...")
@@ -82,9 +84,9 @@ async def lifespan(app: FastAPI):
     pipeline_scheduler.start()
 
     if mode == "continuous":
-        logger.info("?? Pipeline in CONTINUOUS mode - runs immediately after completion")
+        logger.info("🔄 Pipeline in CONTINUOUS mode - runs immediately after completion")
     else:
-        logger.info(f"??  Pipeline in INTERVAL mode - runs every {interval_minutes} minutes")
+        logger.info(f"⏱️  Pipeline in INTERVAL mode - runs every {interval_minutes} minutes")
 
     # 4. Start metadata refresh scheduler
     metadata_mode = os.getenv("METADATA_REFRESH_MODE", "daily")
@@ -110,16 +112,23 @@ async def lifespan(app: FastAPI):
     )
     discogs_scheduler.start()
 
-    logger.info("? All watchers and schedulers started successfully")
+    # 6. Start regenerate scheduler (keeps albums.json / stats.json always fresh)
+    regen_interval = int(os.getenv("REGEN_INTERVAL_MINUTES", "15"))
+    regen_scheduler = get_regenerate_scheduler(interval_minutes=regen_interval)
+    regen_scheduler.start()
+    logger.info(f"[STARTUP] Regenerate scheduler started (every {regen_interval} min, runs immediately on boot)")
+
+    logger.info("✅ All watchers and schedulers started successfully")
 
     yield  # Application is now running
 
     # SHUTDOWN
-    logger.info("?? Shutting down BeetsV7 Backend...")
+    logger.info("🛑 Shutting down BeetsV7 Backend...")
     pipeline_scheduler.stop()
     metadata_scheduler.stop()
     discogs_scheduler.stop()
-    logger.info("? Shutdown complete")
+    regen_scheduler.stop()
+    logger.info("✅ Shutdown complete")
 
 # ---------------------------------------------------------
 # Create FastAPI app with lifespan
@@ -127,7 +136,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="BeetsV7 Music Pipeline API",
     description="Event-driven music ingestion pipeline with continuous processing",
-    version="7.4",
+    version="7.5",
     lifespan=lifespan
 )
 
@@ -168,19 +177,24 @@ def health_check():
     discogs_scheduler = get_discogs_scheduler()
     discogs_status = discogs_scheduler.get_status()
 
+    regen_scheduler = get_regenerate_scheduler()
+    regen_status = regen_scheduler.get_status()
+
     return {
         "status": "healthy",
-        "version": "7.4",
+        "version": "7.5",
         "service": "BeetsV7 Music Pipeline API",
         "pipeline_scheduler": pipeline_status,
         "metadata_scheduler": metadata_status,
         "discogs_scheduler": discogs_status,
+        "regenerate_scheduler": regen_status,
         "watchers": {
             "inbox_settle": "running",
             "metadata": "running",
             "pipeline_scheduler": pipeline_status["running"],
             "metadata_refresh": metadata_status["running"],
             "discogs_refresh": discogs_status["running"],
+            "regenerate": regen_status["running"],
         }
     }
 
@@ -225,6 +239,19 @@ def trigger_discogs_refresh(force: bool = False):
             "(force re-tag all) " if force else ""
         )
     }
+
+@app.get("/api/scheduler/regenerate")
+def regenerate_scheduler_status():
+    """Get regenerate scheduler status."""
+    scheduler = get_regenerate_scheduler()
+    return scheduler.get_status()
+
+@app.post("/api/scheduler/regenerate/run")
+def trigger_regenerate():
+    """Manually trigger an immediate UI JSON regeneration."""
+    scheduler = get_regenerate_scheduler()
+    scheduler.run_now()
+    return {"status": "started", "message": "UI JSON regeneration triggered in background"}
 
 # ---------------------------------------------------------
 # Serve static assets

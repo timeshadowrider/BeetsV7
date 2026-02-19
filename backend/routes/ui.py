@@ -1,16 +1,33 @@
-from fastapi import APIRouter, HTTPException
+# backend/routes/ui.py
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import PlainTextResponse, FileResponse
 from pathlib import Path
 import subprocess
 import threading
+import logging
+import asyncio
 import json
 import os
+import io
+import csv
 from urllib.parse import unquote
 
 DATA_DIR = Path("/data")
 MUSIC_DIR = Path("/music/library")
 LOG_PIPELINE = DATA_DIR / "pipeline_verbose.log"
 LOG_BEETS = DATA_DIR / "last_beets_imports.log"
+LOG_VOLUMIO = DATA_DIR / "volumio_playlist.log"
+VOLUMIO_HOST = "http://10.0.0.102:3000"
+
+# ---------------------------------------------------------
+# Volumio-specific file logger
+# ---------------------------------------------------------
+volumio_logger = logging.getLogger("volumio")
+volumio_logger.setLevel(logging.DEBUG)
+if not volumio_logger.handlers:
+    _vh = logging.FileHandler("/data/volumio_playlist.log")
+    _vh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%H:%M:%S"))
+    volumio_logger.addHandler(_vh)
 
 # ---------------------------------------------------------
 # UI ROUTER (prefix is applied in app.py)
@@ -33,14 +50,46 @@ def run_pipeline():
 
 
 # ---------------------------------------------------------
+# Shared helper: compute live stats from albums.json
+# ---------------------------------------------------------
+def _compute_library_stats(data: list) -> dict:
+    total_tracks = sum(len(a.get("tracks", [])) for a in data)
+    artists = {a.get("albumartist") for a in data if a.get("albumartist")}
+    total_size = sum(t.get("filesize", 0) for a in data for t in a.get("tracks", []))
+    total_duration = sum(t.get("length", 0) for a in data for t in a.get("tracks", []))
+    h = int(total_duration // 3600)
+    m = int((total_duration % 3600) // 60)
+    s = int(total_duration % 60)
+    return {
+        "artists": len(artists),
+        "albums": len(data),
+        "tracks": total_tracks,
+        "total_duration": total_duration,
+        "total_duration_human": f"{h}:{m:02d}:{s:02d}",
+        "total_size": total_size,
+    }
+
+
+def _load_albums() -> list:
+    albums_path = DATA_DIR / "albums.json"
+    if not albums_path.exists():
+        raise HTTPException(404, "albums.json not found")
+    return json.loads(albums_path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------
 # Library Stats
 # ---------------------------------------------------------
 @router.get("/stats/library")
 def get_library_stats():
-    path = DATA_DIR / "stats.json"
-    if not path.exists():
-        raise HTTPException(404, "stats.json not found")
-    return json.loads(path.read_text(encoding="utf-8"))
+    albums_path = DATA_DIR / "albums.json"
+    if albums_path.exists():
+        data = json.loads(albums_path.read_text(encoding="utf-8"))
+        return _compute_library_stats(data)
+    stats_path = DATA_DIR / "stats.json"
+    if stats_path.exists():
+        return json.loads(stats_path.read_text(encoding="utf-8"))
+    raise HTTPException(404, "No stats available")
 
 
 # ---------------------------------------------------------
@@ -51,21 +100,59 @@ def get_inbox_stats():
     inbox = Path("/inbox")
     artists = 0
     tracks = 0
-
     for artist_dir in inbox.iterdir():
         if not artist_dir.is_dir() or artist_dir.name == "failed_imports":
             continue
-
         artists += 1
-
         for root, dirs, files in os.walk(artist_dir):
             for f in files:
-                if Path(f).suffix.lower() in {
-                    ".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"
-                }:
+                if Path(f).suffix.lower() in {".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac"}:
                     tracks += 1
-
     return {"artists": artists, "tracks": tracks}
+
+
+# ---------------------------------------------------------
+# Full Library Analytics
+# ---------------------------------------------------------
+@router.get("/stats")
+def get_global_stats():
+    data = _load_albums()
+    formats = {}
+    bit_depths = {}
+    sample_rates = {}
+    genres = {}
+    years = {}
+    total_tracks = 0
+    artists = set()
+    for album in data:
+        aa = album.get("albumartist")
+        if aa:
+            artists.add(aa)
+        total_tracks += len(album.get("tracks", []))
+        for t in album.get("tracks", []):
+            codec = (t.get("codec") or "").lower()
+            if codec:
+                formats[codec] = formats.get(codec, 0) + 1
+            bd = t.get("bit_depth")
+            if bd:
+                bit_depths[str(bd)] = bit_depths.get(str(bd), 0) + 1
+            sr = t.get("sample_rate")
+            if sr:
+                sample_rates[str(sr)] = sample_rates.get(str(sr), 0) + 1
+            g = t.get("genre")
+            if g:
+                genres[g] = genres.get(g, 0) + 1
+            y = t.get("year")
+            if y:
+                years[str(y)] = years.get(str(y), 0) + 1
+    return {
+        "library": {"albums": len(data), "tracks": total_tracks, "artists": len(artists), "album_artists": len(artists)},
+        "formats": formats,
+        "bit_depths": bit_depths,
+        "sample_rates": sample_rates,
+        "genres": genres,
+        "years": years,
+    }
 
 
 # ---------------------------------------------------------
@@ -76,17 +163,12 @@ def get_recent_albums():
     path = DATA_DIR / "recent_albums.json"
     if not path.exists():
         raise HTTPException(404, "recent_albums.json not found")
-
     data = json.loads(path.read_text(encoding="utf-8"))
-    return sorted(
-        data,
-        key=lambda a: a.get("added", a.get("mtime", "")),
-        reverse=True
-    )
+    return sorted(data, key=lambda a: a.get("added", a.get("mtime", "")), reverse=True)
 
 
 # ---------------------------------------------------------
-# All Albums (for search + webplayer)
+# All Albums
 # ---------------------------------------------------------
 @router.get("/albums/all")
 def get_all_albums():
@@ -97,22 +179,15 @@ def get_all_albums():
 
 
 # ---------------------------------------------------------
-# Cover Art Endpoint (NEW)
+# Cover Art
 # ---------------------------------------------------------
 @router.get("/library/cover/{artist}/{album}")
 def get_cover(artist: str, album: str):
-    """
-    Serve cover.jpg for a given artist + album.
-    This matches the JSON paths generated by generate_ui_json().
-    """
     artist = unquote(artist)
     album = unquote(album)
-
     cover_path = MUSIC_DIR / artist / album / "cover.jpg"
-
     if not cover_path.exists():
         raise HTTPException(404, "Cover not found")
-
     return FileResponse(str(cover_path), media_type="image/jpeg")
 
 
@@ -132,81 +207,209 @@ def get_beets_log():
         raise HTTPException(404, "beets log not found")
     return LOG_BEETS.read_text(encoding="utf-8")
 
-# ---------------------------------------------------------
-# Stats
-# ---------------------------------------------------------
+
+@router.get("/logs/volumio", response_class=PlainTextResponse)
+def get_volumio_log():
+    if not LOG_VOLUMIO.exists():
+        return ""
+    return LOG_VOLUMIO.read_text(encoding="utf-8")
 
 
-@router.get("/stats")
-def get_global_stats():
+@router.delete("/logs/volumio")
+def clear_volumio_log():
+    if LOG_VOLUMIO.exists():
+        LOG_VOLUMIO.write_text("", encoding="utf-8")
+    return {"status": "cleared"}
+
+
+# =============================================================
+# Volumio Playlist Builder (Spotify CSV -> Volumio WebSocket)
+# =============================================================
+
+def _search_beets_for_track(title: str, artist: str) -> str | None:
+    try:
+        volumio_logger.info(f"[VOLUMIO] Searching: '{artist} - {title}'")
+        result = subprocess.run(
+            ["beet", "ls", "-p", f"title:{title}", f"artist:{artist}"],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        if lines:
+            volumio_logger.info(f"[VOLUMIO] MATCH (title+artist): {lines[0]}")
+            return lines[0]
+
+        result = subprocess.run(
+            ["beet", "ls", "-p", f"title:{title}"],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        if lines:
+            volumio_logger.info(f"[VOLUMIO] MATCH (title only): {lines[0]}")
+            return lines[0]
+
+        volumio_logger.warning(f"[VOLUMIO] NO MATCH: '{artist} - {title}'")
+    except Exception as e:
+        volumio_logger.error(f"[VOLUMIO] Beets error for '{title}': {e}")
+    return None
+
+
+def _path_to_volumio_uri(abs_path: str) -> str:
+    prefix = "/music/library/"
+    if abs_path.startswith(prefix):
+        return "mnt/NAS/MUSIC/" + abs_path[len(prefix):]
+    return abs_path
+
+
+async def _push_playlist_via_socket(playlist_name: str, entries: list) -> int:
     """
-    Full library analytics for the UI dashboard.
-    Pulls from albums.json and computes:
-    - file type counts
-    - codec counts
-    - bit depth distribution
-    - sample rate distribution
-    - genre distribution
-    - year distribution
-    - total tracks, albums, artists
+    Push playlist to Volumio using socket.io (Volumio 4 event names).
+    createPlaylist + addToPlaylist are the correct Volumio 4 events.
     """
-    albums_path = DATA_DIR / "albums.json"
-    if not albums_path.exists():
-        raise HTTPException(404, "albums.json not found")
+    import socketio
 
-    data = json.loads(albums_path.read_text(encoding="utf-8"))
+    sio = socketio.AsyncClient(logger=False, engineio_logger=False)
+    errors = 0
+    connected = False
 
-    formats = {}
-    bit_depths = {}
-    sample_rates = {}
-    genres = {}
-    years = {}
+    try:
+        volumio_logger.info(f"[VOLUMIO] Connecting via WebSocket to {VOLUMIO_HOST}...")
+        await sio.connect(VOLUMIO_HOST, transports=["websocket"])
+        connected = True
+        volumio_logger.info("[VOLUMIO] WebSocket connected")
 
-    total_tracks = 0
-    artists = set()
-    album_artists = set()
+        # Delete existing playlist if it exists, then create fresh
+        await sio.emit("deletePlaylist", {"name": playlist_name})
+        await asyncio.sleep(0.5)
 
-    for album in data:
-        artists.add(album.get("albumartist"))
-        album_artists.add(album.get("albumartist"))
-        total_tracks += len(album.get("tracks", []))
+        await sio.emit("createPlaylist", {"name": playlist_name})
+        await asyncio.sleep(0.5)
+        volumio_logger.info(f"[VOLUMIO] Created playlist '{playlist_name}'")
 
-        for t in album.get("tracks", []):
-            # codec / file type
-            codec = (t.get("codec") or "").lower()
-            formats[codec] = formats.get(codec, 0) + 1
+        # Add each track using Volumio 4 addToPlaylist event
+        for entry in entries:
+            await sio.emit("addToPlaylist", {
+                "name": playlist_name,
+                "uri":  entry["uri"],
+                "service": entry["service"],
+                "title":   entry["title"],
+                "artist":  entry["artist"],
+                "album":   entry["album"],
+            })
+            await asyncio.sleep(0.15)
+            volumio_logger.info(f"[VOLUMIO] Added: {entry['title']} by {entry['artist']}")
 
-            # bit depth
-            bd = t.get("bit_depth")
-            if bd:
-                bit_depths[str(bd)] = bit_depths.get(str(bd), 0) + 1
+        # Give Volumio a moment to persist
+        await asyncio.sleep(1.0)
+        volumio_logger.info(f"[VOLUMIO] All {len(entries)} tracks sent via WebSocket")
 
-            # sample rate
-            sr = t.get("sample_rate")
-            if sr:
-                sample_rates[str(sr)] = sample_rates.get(str(sr), 0) + 1
+    except Exception as e:
+        volumio_logger.error(f"[VOLUMIO] WebSocket error: {e}")
+        errors = len(entries)
+    finally:
+        if connected:
+            await sio.disconnect()
 
-            # genre
-            g = t.get("genre")
-            if g:
-                genres[g] = genres.get(g, 0) + 1
+    return errors
 
-            # year
-            y = t.get("year")
-            if y:
-                years[str(y)] = years.get(str(y), 0) + 1
+
+@router.post("/volumio/playlist/upload")
+async def build_volumio_playlist(file: UploadFile = File(...)):
+    """
+    Accept a Spotify CSV, match tracks against Beets,
+    push playlist to Volumio via WebSocket (socket.io).
+    """
+    # Clear log for fresh run
+    LOG_VOLUMIO.write_text("", encoding="utf-8")
+    volumio_logger.info(f"[VOLUMIO] === New build: {file.filename} ===")
+
+    # 1. Parse CSV
+    contents = await file.read()
+    try:
+        text = contents.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        rows = list(reader)
+    except Exception as e:
+        raise HTTPException(400, f"Could not parse CSV: {e}")
+
+    if not rows:
+        raise HTTPException(400, "CSV file is empty")
+
+    # 2. Auto-detect columns
+    sample = rows[0]
+    cols = list(sample.keys())
+    volumio_logger.info(f"[VOLUMIO] CSV columns: {cols}")
+
+    title_col = (
+        next((c for c in cols if "track" in c.lower() and "name" in c.lower()), None)
+        or next((c for c in cols if "title" in c.lower()), None)
+    )
+    artist_col = next((c for c in cols if "artist" in c.lower()), None)
+    album_col  = next((c for c in cols if "album" in c.lower()), None)
+
+    if not title_col:
+        raise HTTPException(400, f"Cannot find track title column. Columns: {cols}")
+
+    volumio_logger.info(f"[VOLUMIO] Columns: title='{title_col}' artist='{artist_col}' album='{album_col}'")
+    volumio_logger.info(f"[VOLUMIO] {len(rows)} tracks to process...")
+
+    # 3. Match each track against Beets
+    playlist_name = file.filename.replace(".csv", "").replace("_", " ")
+    playlist_entries = []
+    unmatched = []
+
+    for row in rows:
+        title  = row.get(title_col, "").strip()
+        artist = row.get(artist_col, "").strip() if artist_col else ""
+        album  = row.get(album_col,  "").strip() if album_col  else ""
+        if not title:
+            continue
+        abs_path = _search_beets_for_track(title, artist)
+        if abs_path:
+            playlist_entries.append({
+                "service": "mpd",
+                "uri":     _path_to_volumio_uri(abs_path),
+                "title":   title,
+                "artist":  artist,
+                "album":   album,
+            })
+        else:
+            unmatched.append(f"{artist} - {title}" if artist else title)
+
+    volumio_logger.info(f"[VOLUMIO] Search complete: {len(playlist_entries)} matched, {len(unmatched)} unmatched")
+
+    if not playlist_entries:
+        return {
+            "status": "no_matches",
+            "playlist": playlist_name,
+            "matched": 0,
+            "total": len(rows),
+            "unmatched": unmatched,
+            "message": "No tracks from the CSV were found in your Beets library.",
+        }
+
+    # 4. Push to Volumio via WebSocket
+    volumio_logger.info(f"[VOLUMIO] Pushing {len(playlist_entries)} tracks as '{playlist_name}'...")
+    errors = await _push_playlist_via_socket(playlist_name, playlist_entries)
+
+    volumio_logger.info(f"[VOLUMIO] === Done: {len(playlist_entries)} sent, {errors} errors ===")
 
     return {
-        "library": {
-            "albums": len(data),
-            "tracks": total_tracks,
-            "artists": len(artists),
-            "album_artists": len(album_artists),
-        },
-        "formats": formats,
-        "bit_depths": bit_depths,
-        "sample_rates": sample_rates,
-        "genres": genres,
-        "years": years,
+        "status": "ok",
+        "playlist": playlist_name,
+        "matched": len(playlist_entries),
+        "unmatched_count": len(unmatched),
+        "total": len(rows),
+        "volumio_errors": errors,
+        "unmatched": unmatched[:20],
     }
 
+
+@router.get("/volumio/playlists")
+def list_volumio_playlists():
+    """List playlists Volumio knows about via REST API."""
+    import httpx
+    try:
+        resp = httpx.get(f"{VOLUMIO_HOST}/api/v1/listplaylists", timeout=5.0)
+        return {"playlists": resp.json()}
+    except Exception as e:
+        raise HTTPException(502, f"Cannot reach Volumio: {e}")

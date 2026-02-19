@@ -1,0 +1,9 @@
+[
+  {
+    "service": "mpd",
+    "uri": "mnt/NAS/MUSIC/_test/test_track.flac",
+    "title": "Write Test Track",
+    "artist": "BeetsV7",
+    "album": "Write Test"
+  }
+]
