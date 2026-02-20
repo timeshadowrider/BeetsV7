@@ -10,6 +10,7 @@ export default function App() {
     { to: "/", label: "Dashboard" },
     { to: "/player", label: "Web Player" },
     { to: "/volumio", label: "Volumio Builder" },
+    { to: "/slskd", label: "SLSKD Search" },
     { to: "/logs", label: "Logs" },
     { to: "/pipeline", label: "Pipeline" }
   ];

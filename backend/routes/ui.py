@@ -1,5 +1,5 @@
 # backend/routes/ui.py
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Request
 from fastapi.responses import PlainTextResponse, FileResponse
 from pathlib import Path
 import subprocess
@@ -10,6 +10,7 @@ import json
 import os
 import io
 import csv
+import unicodedata
 from urllib.parse import unquote
 
 DATA_DIR = Path("/data")
@@ -226,30 +227,73 @@ def clear_volumio_log():
 # Volumio Playlist Builder (Spotify CSV -> Volumio WebSocket)
 # =============================================================
 
-def _search_beets_for_track(title: str, artist: str) -> str | None:
+def _strip_diacritics(s: str) -> str:
+    """Remove diacritics/accents: BØRNS -> BORNS, Sigur Rós -> Sigur Ros, etc."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+
+def _beet_query(title: str, artist: str = "") -> str | None:
+    """
+    Run a single beet ls query using shell=True so that quoting behaves
+    identically to the interactive terminal (double-quoted args handle
+    spaces and Unicode correctly).
+    Returns the first matched path, or None.
+    """
+    if artist:
+        cmd = f'beet ls -p title:"{title}" artist:"{artist}"'
+    else:
+        cmd = f'beet ls -p title:"{title}"'
     try:
-        volumio_logger.info(f"[VOLUMIO] Searching: '{artist} - {title}'")
-        result = subprocess.run(
-            ["beet", "ls", "-p", f"title:{title}", f"artist:{artist}"],
-            capture_output=True, text=True, timeout=10
-        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
         lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        if lines:
-            volumio_logger.info(f"[VOLUMIO] MATCH (title+artist): {lines[0]}")
-            return lines[0]
-
-        result = subprocess.run(
-            ["beet", "ls", "-p", f"title:{title}"],
-            capture_output=True, text=True, timeout=10
-        )
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        if lines:
-            volumio_logger.info(f"[VOLUMIO] MATCH (title only): {lines[0]}")
-            return lines[0]
-
-        volumio_logger.warning(f"[VOLUMIO] NO MATCH: '{artist} - {title}'")
+        return lines[0] if lines else None
     except Exception as e:
-        volumio_logger.error(f"[VOLUMIO] Beets error for '{title}': {e}")
+        volumio_logger.error(f"[VOLUMIO] beet query error ({cmd!r}): {e}")
+        return None
+
+
+def _search_beets_for_track(title: str, artist: str) -> str | None:
+    """
+    Four-pass search for maximum match rate:
+
+    Pass 1 – exact title + exact artist         e.g. "Electric Love" / "BØRNS"
+    Pass 2 – exact title + diacritic-stripped   e.g. "Electric Love" / "BORNS"
+             (only attempted when artist contains non-ASCII)
+    Pass 3 – exact title + first artist only    e.g. "Electric Love" / "Luis Fonsi"
+             (handles CSV multi-artist "Luis Fonsi;Daddy Yankee")
+    Pass 4 – title only                         last-resort fallback
+    """
+    volumio_logger.info(f"[VOLUMIO] Searching: '{artist} - {title}'")
+
+    # Pass 1: exact
+    path = _beet_query(title, artist)
+    if path:
+        volumio_logger.info(f"[VOLUMIO] MATCH pass1 (exact): {path}")
+        return path
+
+    # Pass 2: diacritic-stripped artist (BØRNS -> BORNS)
+    artist_ascii = _strip_diacritics(artist)
+    if artist_ascii != artist:
+        path = _beet_query(title, artist_ascii)
+        if path:
+            volumio_logger.info(f"[VOLUMIO] MATCH pass2 (ascii artist): {path}")
+            return path
+
+    # Pass 3: first artist only (split on ; or ,)
+    artist_primary = artist.replace(";", ",").split(",")[0].strip()
+    if artist_primary != artist and artist_primary:
+        path = _beet_query(title, artist_primary)
+        if path:
+            volumio_logger.info(f"[VOLUMIO] MATCH pass3 (primary artist): {path}")
+            return path
+
+    # Pass 4: title only
+    path = _beet_query(title)
+    if path:
+        volumio_logger.info(f"[VOLUMIO] MATCH pass4 (title only): {path}")
+        return path
+
+    volumio_logger.warning(f"[VOLUMIO] NO MATCH: '{artist} - {title}'")
     return None
 
 
@@ -413,3 +457,101 @@ def list_volumio_playlists():
         return {"playlists": resp.json()}
     except Exception as e:
         raise HTTPException(502, f"Cannot reach Volumio: {e}")
+
+# =============================================================
+# SLSKD Proxy Routes
+# Proxies SLSKD API calls from the frontend to avoid CORS issues.
+# The browser cannot call SLSKD directly cross-origin, so all
+# requests are tunnelled through this FastAPI backend.
+# =============================================================
+
+SLSKD_HOST    = "http://10.0.0.100:5030"
+SLSKD_API_KEY = "PV1RixwWGOi91oVYfSMhd7JNVy1hj6jpcBOcdM+z1mKB+JnIQ2c4nwVWLgYi2JHd"
+SLSKD_HEADERS = {"X-API-Key": SLSKD_API_KEY}
+
+
+@router.post("/slskd/searches")
+async def slskd_search_proxy(payload: dict):
+    """Initiate a SLSKD search and return the search object (with id)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SLSKD_HOST}/api/v0/searches",
+                headers=SLSKD_HEADERS,
+                json=payload,
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"SLSKD error: {e}")
+
+
+@router.get("/slskd/searches/{search_id}")
+async def slskd_poll_proxy(search_id: str):
+    """Poll a SLSKD search state (isComplete, fileCount). Does NOT contain file results."""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SLSKD_HOST}/api/v0/searches/{search_id}",
+                headers=SLSKD_HEADERS,
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"SLSKD error: {e}")
+
+
+@router.get("/slskd/searches/{search_id}/responses")
+async def slskd_responses_proxy(search_id: str):
+    """Get the actual file results for a completed SLSKD search (separate endpoint from state)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SLSKD_HOST}/api/v0/searches/{search_id}/responses",
+                headers=SLSKD_HEADERS,
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"SLSKD error: {e}")
+
+
+@router.post("/slskd/downloads/{username}")
+async def slskd_download_proxy(username: str, request: Request):
+    """Queue a download on SLSKD. Pass raw body straight through to preserve backslashes."""
+    import httpx
+    try:
+        raw_body = await request.body()
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SLSKD_HOST}/api/v0/transfers/downloads/{username}",
+                headers={**SLSKD_HEADERS, "Content-Type": "application/json"},
+                content=raw_body,
+                timeout=15.0,
+            )
+            return {"status": r.status_code, "ok": r.is_success}
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"SLSKD error: {e}")
+
+
+@router.get("/slskd/transfers")
+async def slskd_transfers_proxy():
+    """Return current SLSKD download transfers (for active transfer count)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SLSKD_HOST}/api/v0/transfers/downloads",
+                headers=SLSKD_HEADERS,
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"SLSKD error: {e}")
