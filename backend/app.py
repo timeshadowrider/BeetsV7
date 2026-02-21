@@ -13,6 +13,7 @@ Includes:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import logging
 import os
@@ -252,6 +253,16 @@ def trigger_regenerate():
     scheduler = get_regenerate_scheduler()
     scheduler.run_now()
     return {"status": "started", "message": "UI JSON regeneration triggered in background"}
+
+# ---------------------------------------------------------
+# Fallback cover art
+# Catches any /fallback-covers/* request and returns the
+# placeholder PNG so the frontend never shows broken images.
+# Must be registered BEFORE the static/public mounts below.
+# ---------------------------------------------------------
+@app.get("/fallback-covers/{filename:path}")
+async def fallback_cover(filename: str):
+    return FileResponse("/app/static/placeholder-cover.png", media_type="image/png")
 
 # ---------------------------------------------------------
 # Serve static assets

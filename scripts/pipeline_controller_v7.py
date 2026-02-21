@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v7.5 HYBRID Pipeline Controller
+v7.6 HYBRID Pipeline Controller
 
-Changes from v7.4:
-- active_paths is now refreshed per-artist instead of captured once at startup.
-  Previously a single snapshot was taken before the artist loop began. If SLSKD
-  started a new download mid-run, the stale snapshot would not catch it, meaning
-  a partially-downloaded folder could be moved to pre-library and fail to import.
-- global_settle() still runs at startup as a gate, but slskd_active_transfers()
-  is called again before each individual artist is processed.
+Changes from v7.5:
+- Added clear_prelibrary() function that wipes /pre-library at the start of
+  each pipeline run (after failed_imports are quarantined but before processing).
+  Previously pre-library was never explicitly cleared between runs, causing
+  successfully-imported files that beets didn't move out (duplicates, below-
+  threshold matches, etc.) to accumulate across runs and fill the tmpfs.
+- clear_prelibrary() skips the failed_imports subfolder so quarantine logic
+  can still handle those separately.
+- Called in main() immediately after quarantine_failed_imports_global(PRELIB).
 """
 import fcntl
 import os
@@ -109,6 +111,57 @@ class PipelineLock:
             self.lock_fd.close()
             log("[LOCK] Lock released")
         return False
+
+
+def clear_prelibrary():
+    """
+    Wipe /pre-library at the start of each pipeline run.
+
+    Called after quarantine_failed_imports_global() so any failed_imports
+    subfolders are already moved to quarantine before we clear. We skip
+    any remaining failed_imports folder here as a safety net in case
+    quarantine didn't handle it (e.g. settled check failed).
+
+    Why this is needed:
+    - Beets moves successfully imported files out of pre-library into the
+      library automatically, so those disappear on their own.
+    - But files that beets skips (duplicates, below-threshold matches,
+      unrecognised formats) are left behind in pre-library indefinitely.
+    - On a tmpfs mount these accumulate across runs and eventually fill
+      the volume, blocking all future moves from inbox -> pre-library.
+    - Clearing at startup ensures each run starts with a clean slate.
+      Any genuinely un-importable files will be caught by beets on the
+      next attempt anyway -- we're not losing anything by clearing them.
+    """
+    if not PRELIB.exists():
+        return
+
+    cleared = 0
+    errors = 0
+
+    log("[PRELIB] Clearing pre-library before new pipeline run...")
+
+    for item in PRELIB.iterdir():
+        # Leave failed_imports for the quarantine module to handle
+        if item.name == "failed_imports":
+            log("[PRELIB] Skipping failed_imports (handled by quarantine)")
+            continue
+
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            log("[PRELIB] Cleared: %s" % item.name)
+            cleared += 1
+        except Exception as e:
+            log("[PRELIB] Could not clear %s: %s" % (item.name, e))
+            errors += 1
+
+    if errors:
+        log("[PRELIB] WARNING: %d items could not be cleared - check permissions" % errors)
+
+    log("[PRELIB] Pre-library cleared (%d items removed, %d errors)" % (cleared, errors))
 
 
 def cleanup_invalid_failed_imports():
@@ -380,11 +433,17 @@ def process_artist(artist_folder: Path, active_paths):
 def main():
     try:
         with PipelineLock(timeout=5):
-            log("=== v7.5 Hybrid Pipeline Controller ===")
+            log("=== v7.6 Hybrid Pipeline Controller ===")
             update_status("running", "starting pipeline")
 
             cleanup_invalid_failed_imports()
             quarantine_failed_imports_global(PRELIB)
+
+            # NEW v7.6: Clear pre-library before each run so leftover files
+            # from previous runs (duplicates, unmatched, etc.) don't
+            # accumulate and fill the tmpfs. Must run AFTER quarantine so
+            # failed_imports are safely moved out first.
+            clear_prelibrary()
 
             # FIX: Removed global_settle() as a hard gate. Previously the pipeline
             # would block until ALL SLSKD transfers finished (threshold=0), meaning
@@ -438,7 +497,7 @@ def main():
             trigger_subsonic_scan_from_config()
             trigger_volumio_rescan()
 
-            log("=== v7.5 Pipeline Finished ===")
+            log("=== v7.6 Pipeline Finished ===")
             update_status("success", "pipeline finished")
 
     except RuntimeError as e:

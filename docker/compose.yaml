@@ -60,11 +60,11 @@ services:
     # /tmp/pipeline-work: scratch space for fingerprints.json and pipeline working files - 1GB
     #   fingerprint_all.py writes/rewrites fingerprints.json constantly during import runs
     tmpfs:
-      - /pre-library:size=6g,mode=0755,uid=1000,gid=1000
+      - /pre-library:size=8g,mode=0755,uid=1000,gid=1000
       - /tmp/pipeline-work:size=1g,mode=0755,uid=1000,gid=1000
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:7080/api/stats || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:7080/api/ui/stats/library || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
