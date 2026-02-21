@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v7.6 HYBRID Pipeline Controller
+v7.7 HYBRID Pipeline Controller
 
-Changes from v7.5:
-- Added clear_prelibrary() function that wipes /pre-library at the start of
-  each pipeline run (after failed_imports are quarantined but before processing).
-  Previously pre-library was never explicitly cleared between runs, causing
-  successfully-imported files that beets didn't move out (duplicates, below-
-  threshold matches, etc.) to accumulate across runs and fill the tmpfs.
-- clear_prelibrary() skips the failed_imports subfolder so quarantine logic
-  can still handle those separately.
-- Called in main() immediately after quarantine_failed_imports_global(PRELIB).
+Changes from v7.6:
+- drain_prelibrary(): new helper that runs fingerprint+import+post-process
+  on whatever is currently in pre-library, then clears it. Used at startup
+  (replacing the plain clear) and mid-run when the tmpfs is getting full.
+
+- prelibrary_usage_pct(): reads the tmpfs usage via os.statvfs and returns
+  0-100. Called before each album/group move in the processing loops.
+
+- Proactive tmpfs monitoring: before moving each album folder or loose file
+  group to pre-library, if usage >= PRELIB_DRAIN_THRESHOLD (default 85%)
+  the controller drains pre-library first rather than waiting for ENOSPC.
+  This prevents the hard-stop failures seen with Bush (7 albums of FLAC
+  filling 8GB before beets could import any of them).
+
+- PreLibraryFullError catch: even with proactive draining, a single very
+  large album could still fill the tmpfs on its own. Both move functions
+  now raise PreLibraryFullError on ENOSPC so the controller can do an
+  emergency drain and retry once.
+
+- metadata.py fix: the /pre-library/inbox/ path bug was in metadata.py's
+  load_basic_tags() fallback -- fixed there, not here. See metadata.py.
+
+- Version string updated to v7.7.
 """
+import errno
 import fcntl
 import os
 import subprocess
@@ -27,7 +42,11 @@ from scripts.pipeline.slskd import artist_in_use, slskd_active_transfers
 from scripts.pipeline.sabnzbd import sabnzbd_is_processing
 from scripts.pipeline.settle import folder_is_settled
 from scripts.pipeline.cleanup import cleanup_inbox_junk, cleanup_empty_inbox_tree
-from scripts.pipeline.moves import move_group_to_prelibrary, move_existing_album_folder_to_prelibrary
+from scripts.pipeline.moves import (
+    move_group_to_prelibrary,
+    move_existing_album_folder_to_prelibrary,
+    PreLibraryFullError,
+)
 from scripts.pipeline.metadata import group_files_by_album
 from scripts.pipeline.beets import run_fingerprint, run_beets_import, run_post_import
 from scripts.pipeline.system_hooks import (
@@ -43,6 +62,118 @@ from scripts.pipeline.regenerate import generate_ui_json
 CHUNK_SIZE = 500
 LOCK_FILE = Path("/data/pipeline.lock")
 
+# Drain pre-library when tmpfs usage reaches this percentage.
+# 85% gives enough headroom to move the next album before hitting 100%.
+PRELIB_DRAIN_THRESHOLD = 85
+
+
+# ---------------------------------------------------------------------------
+# tmpfs monitoring
+# ---------------------------------------------------------------------------
+
+def prelibrary_usage_pct() -> float:
+    """
+    Return the pre-library tmpfs usage as a percentage (0.0 - 100.0).
+    Uses os.statvfs for an accurate kernel-level read -- no df subprocess.
+    Returns 0.0 if PRELIB doesn't exist or statvfs fails.
+    """
+    try:
+        st = os.statvfs(str(PRELIB))
+        total = st.f_blocks * st.f_frsize
+        free  = st.f_bfree  * st.f_frsize
+        if total == 0:
+            return 0.0
+        used = total - free
+        pct = (used / total) * 100.0
+        return pct
+    except Exception as e:
+        log("[PRELIB] Could not read tmpfs usage: %s" % e)
+        return 0.0
+
+
+def log_prelibrary_usage():
+    pct = prelibrary_usage_pct()
+    log("[PRELIB] Usage: %.1f%%" % pct)
+    return pct
+
+
+# ---------------------------------------------------------------------------
+# Pre-library management
+# ---------------------------------------------------------------------------
+
+def clear_prelibrary():
+    """
+    Wipe /pre-library contents, skipping the failed_imports subfolder.
+    Called inside drain_prelibrary() after each import cycle.
+    """
+    if not PRELIB.exists():
+        return
+
+    cleared = 0
+    errors = 0
+
+    for item in PRELIB.iterdir():
+        if item.name == "failed_imports":
+            log("[PRELIB] Skipping failed_imports (handled by quarantine)")
+            continue
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            cleared += 1
+        except Exception as e:
+            log("[PRELIB] Could not clear %s: %s" % (item.name, e))
+            errors += 1
+
+    if errors:
+        log("[PRELIB] WARNING: %d items could not be cleared" % errors)
+
+    log("[PRELIB] Pre-library cleared (%d items removed, %d errors)" % (cleared, errors))
+
+
+def drain_prelibrary(reason: str = "startup"):
+    """
+    Import whatever is in pre-library right now, then wipe it.
+
+    Sequence: quarantine failed_imports -> fingerprint -> import ->
+              post-process -> clear.
+
+    Called at pipeline startup (to drain leftovers from the previous run)
+    and mid-run when tmpfs usage hits PRELIB_DRAIN_THRESHOLD or when a
+    PreLibraryFullError is raised.
+    """
+    pct = prelibrary_usage_pct()
+    log("[DRAIN] Draining pre-library (%s, current usage %.1f%%)..." % (reason, pct))
+    quarantine_failed_imports_global(PRELIB)
+    run_fingerprint()
+    run_beets_import()
+    run_post_import()
+    clear_prelibrary()
+    log("[DRAIN] Pre-library drained (%.1f%% -> %.1f%%)" % (pct, prelibrary_usage_pct()))
+
+
+def maybe_drain_prelibrary(context: str = ""):
+    """
+    Check tmpfs usage and drain proactively if >= PRELIB_DRAIN_THRESHOLD.
+    Call this before moving each album or group to pre-library.
+
+    Returns True if a drain was triggered.
+    """
+    pct = prelibrary_usage_pct()
+    if pct >= PRELIB_DRAIN_THRESHOLD:
+        log("[PRELIB] Usage %.1f%% >= threshold %d%% — draining before next move%s" % (
+            pct, PRELIB_DRAIN_THRESHOLD,
+            (" (%s)" % context) if context else "",
+        ))
+        drain_prelibrary("proactive threshold drain")
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Lock
+# ---------------------------------------------------------------------------
 
 class PipelineLock:
     """File-based lock to prevent concurrent pipeline runs."""
@@ -54,19 +185,9 @@ class PipelineLock:
 
     def __enter__(self):
         log("[LOCK] Attempting to acquire lock: %s" % self.lockfile)
-
         self.lockfile.touch(exist_ok=True)
-
-        # FIX: Open with 'a' (append) not 'r' (read-only).
-        # fcntl.flock(LOCK_EX) on a read-only file descriptor is unreliable
-        # on some Linux kernels and will always fail with EBADF.
         self.lock_fd = open(self.lockfile, "a")
 
-        # FIX: Auto-clear stale lock left behind by a container restart.
-        # A restarted container will never have a live process holding the lock,
-        # so if we can't acquire it within the timeout it must be stale.
-        # We attempt a non-blocking lock first; if it fails we check whether
-        # any pipeline process is actually running before giving up.
         start_time = time.time()
         while True:
             try:
@@ -75,17 +196,14 @@ class PipelineLock:
                 return self
             except IOError:
                 if time.time() - start_time >= self.timeout:
-                    # Check if a pipeline process is actually alive
                     try:
                         check = subprocess.run(
                             ["pgrep", "-f", "pipeline_controller_v7.py"],
                             capture_output=True, text=True
                         )
-                        # pgrep returns our own PID too, so filter it out
                         pids = [p for p in check.stdout.strip().splitlines()
                                 if p.strip() != str(os.getpid())]
                         if not pids:
-                            # No other pipeline process running -- stale lock
                             log("[LOCK] Stale lock detected (no live process). Clearing.")
                             self.lock_fd.close()
                             self.lockfile.unlink(missing_ok=True)
@@ -113,73 +231,16 @@ class PipelineLock:
         return False
 
 
-def clear_prelibrary():
-    """
-    Wipe /pre-library at the start of each pipeline run.
-
-    Called after quarantine_failed_imports_global() so any failed_imports
-    subfolders are already moved to quarantine before we clear. We skip
-    any remaining failed_imports folder here as a safety net in case
-    quarantine didn't handle it (e.g. settled check failed).
-
-    Why this is needed:
-    - Beets moves successfully imported files out of pre-library into the
-      library automatically, so those disappear on their own.
-    - But files that beets skips (duplicates, below-threshold matches,
-      unrecognised formats) are left behind in pre-library indefinitely.
-    - On a tmpfs mount these accumulate across runs and eventually fill
-      the volume, blocking all future moves from inbox -> pre-library.
-    - Clearing at startup ensures each run starts with a clean slate.
-      Any genuinely un-importable files will be caught by beets on the
-      next attempt anyway -- we're not losing anything by clearing them.
-    """
-    if not PRELIB.exists():
-        return
-
-    cleared = 0
-    errors = 0
-
-    log("[PRELIB] Clearing pre-library before new pipeline run...")
-
-    for item in PRELIB.iterdir():
-        # Leave failed_imports for the quarantine module to handle
-        if item.name == "failed_imports":
-            log("[PRELIB] Skipping failed_imports (handled by quarantine)")
-            continue
-
-        try:
-            if item.is_dir():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-            log("[PRELIB] Cleared: %s" % item.name)
-            cleared += 1
-        except Exception as e:
-            log("[PRELIB] Could not clear %s: %s" % (item.name, e))
-            errors += 1
-
-    if errors:
-        log("[PRELIB] WARNING: %d items could not be cleared - check permissions" % errors)
-
-    log("[PRELIB] Pre-library cleared (%d items removed, %d errors)" % (cleared, errors))
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def cleanup_invalid_failed_imports():
-    """
-    Remove failed_imports folders from locations they should never exist.
-
-    FIX: shutil.rmtree fails with Permission denied if any file inside is
-    read-only or owned by a different user. We chmod everything writable
-    first. If chmod fails we log and attempt removal anyway.
-    """
     invalid_locations = [Path("/inbox/failed_imports")]
     for path in invalid_locations:
         if not path.exists():
             continue
-
         log("[CLEANUP] Removing invalid failed_imports from: %s" % path)
-
-        # Make everything writable before rmtree
         for root, dirs, files in os.walk(str(path)):
             for d in dirs:
                 try:
@@ -190,8 +251,7 @@ def cleanup_invalid_failed_imports():
                 try:
                     os.chmod(os.path.join(root, f), 0o644)
                 except Exception as e:
-                    log("[CLEANUP] Cannot chmod %s: %s -- will attempt removal anyway" % (f, e))
-
+                    log("[CLEANUP] Cannot chmod %s: %s -- attempting removal anyway" % (f, e))
         try:
             shutil.rmtree(path)
             log("[CLEANUP] Successfully removed: %s" % path)
@@ -212,7 +272,6 @@ def list_artist_folders():
 
 
 def quick_corruption_check(filepath: Path) -> bool:
-    """Fast check - verify file is readable and non-trivially small."""
     try:
         if not filepath.exists() or filepath.stat().st_size == 0:
             log("[CORRUPT] Empty or missing: %s" % filepath.name)
@@ -229,7 +288,6 @@ def quick_corruption_check(filepath: Path) -> bool:
 
 
 def quarantine_corrupted_file(filepath: Path):
-    """Move a corrupted file to quarantine."""
     from scripts.pipeline.quarantine import QUARANTINE_ROOT
     QUARANTINE_ROOT.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -246,6 +304,10 @@ def chunk_list(items: list, chunk_size: int):
         yield items[i:i + chunk_size]
 
 
+# ---------------------------------------------------------------------------
+# Core artist processing
+# ---------------------------------------------------------------------------
+
 def process_artist(artist_folder: Path, active_paths):
     """
     Process one artist folder through the full pipeline.
@@ -253,11 +315,13 @@ def process_artist(artist_folder: Path, active_paths):
     Flow:
     1. Safety checks (SLSKD, SABnzbd, settle timer)
     2. Junk cleanup
-    3. Collect loose files NOW before any moves happen
-    4. Collect album subfolders, check corruption
-    5. Move albums to pre-library and import in chunks
-    6. Move loose files to pre-library and import in chunks
-    7. Clean up empty inbox tree
+    3. Collect loose files and album subfolders up front
+    4. Move album subfolders to pre-library in chunks, import each chunk
+       - Before each album move: check tmpfs usage, drain proactively at 85%
+       - On ENOSPC (PreLibraryFullError): emergency drain then retry once
+    5. Move loose file groups to pre-library in chunks, import each chunk
+       - Same proactive and reactive ENOSPC handling
+    6. Clean up empty inbox tree
     """
     if not artist_folder.exists():
         log("[SKIP] Folder disappeared before processing: %s" % artist_folder)
@@ -288,16 +352,12 @@ def process_artist(artist_folder: Path, active_paths):
         log("[SKIP] Folder removed during cleanup: %s" % artist_folder)
         return
 
-    # FIX: Collect BOTH loose files and subfolders NOW before anything is moved.
-    # Previously loose files were collected after album subfolders were moved out,
-    # meaning artist_folder could be empty or gone by the time we checked for them.
     try:
         all_contents = list(artist_folder.iterdir())
     except FileNotFoundError:
         log("[SKIP] Folder disappeared while listing contents: %s" % artist_folder)
         return
 
-    # Separate loose audio files from album subfolders up front
     loose_audio = [
         p for p in all_contents
         if p.is_file()
@@ -359,10 +419,21 @@ def process_artist(artist_folder: Path, active_paths):
             log("[CHUNK] Album chunk %d/%d (%d albums)" % (chunk_idx, len(chunks), len(album_chunk)))
 
             for album in album_chunk:
+                # Proactive: drain before the move if tmpfs is getting full
+                maybe_drain_prelibrary(album.name)
+
                 try:
                     move_existing_album_folder_to_prelibrary(album)
                 except FileNotFoundError:
                     log("[SKIP] Album folder disappeared: %s" % album)
+                except PreLibraryFullError:
+                    # Reactive: ENOSPC despite proactive check (album was huge)
+                    log("[ENOSPC] Emergency drain triggered by: %s" % album.name)
+                    drain_prelibrary("emergency ENOSPC")
+                    try:
+                        move_existing_album_folder_to_prelibrary(album)
+                    except (PreLibraryFullError, Exception) as retry_err:
+                        log("[ENOSPC] Retry failed for %s: %s — skipping" % (album.name, retry_err))
 
             log("[CHUNK] Fingerprinting chunk %d" % chunk_idx)
             run_fingerprint()
@@ -373,9 +444,6 @@ def process_artist(artist_folder: Path, active_paths):
             log("[CHUNK] Post-processing chunk %d" % chunk_idx)
             run_post_import()
 
-            # FIX: Delay check was "chunk_idx * CHUNK_SIZE < total_albums" which
-            # incorrectly skips the delay on the last chunk when total is exact
-            # multiple of CHUNK_SIZE. Now simply check if more chunks remain.
             if chunk_idx < len(chunks):
                 log("[CHUNK] Waiting 2s before next chunk...")
                 time.sleep(2)
@@ -384,7 +452,7 @@ def process_artist(artist_folder: Path, active_paths):
     if loose_audio:
         valid_audio = []
         for audio_file in loose_audio:
-            if audio_file.exists():  # May have been cleaned up already
+            if audio_file.exists():
                 if quick_corruption_check(audio_file):
                     valid_audio.append(audio_file)
                 else:
@@ -402,11 +470,26 @@ def process_artist(artist_folder: Path, active_paths):
                 log("[CHUNK] Loose chunk %d/%d (%d groups)" % (chunk_idx, len(chunks), len(group_chunk)))
 
                 for (aa, al), files in group_chunk:
-                    move_group_to_prelibrary(
-                        aa or artist_folder.name,
-                        al or "Unknown Album",
-                        files,
-                    )
+                    # Proactive: drain before move if tmpfs is getting full
+                    maybe_drain_prelibrary("%s/%s" % (aa, al))
+
+                    try:
+                        move_group_to_prelibrary(
+                            aa or artist_folder.name,
+                            al or "Unknown Album",
+                            files,
+                        )
+                    except PreLibraryFullError:
+                        log("[ENOSPC] Emergency drain triggered by loose group: %s/%s" % (aa, al))
+                        drain_prelibrary("emergency ENOSPC")
+                        try:
+                            move_group_to_prelibrary(
+                                aa or artist_folder.name,
+                                al or "Unknown Album",
+                                files,
+                            )
+                        except (PreLibraryFullError, Exception) as retry_err:
+                            log("[ENOSPC] Retry failed for %s/%s: %s — skipping" % (aa, al, retry_err))
 
                 log("[CHUNK] Fingerprinting loose chunk %d" % chunk_idx)
                 run_fingerprint()
@@ -417,7 +500,6 @@ def process_artist(artist_folder: Path, active_paths):
                 log("[CHUNK] Post-processing loose chunk %d" % chunk_idx)
                 run_post_import()
 
-                # FIX: Same delay fix as above
                 if chunk_idx < len(chunks):
                     log("[CHUNK] Waiting 2s before next chunk...")
                     time.sleep(2)
@@ -430,34 +512,24 @@ def process_artist(artist_folder: Path, active_paths):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
     try:
         with PipelineLock(timeout=5):
-            log("=== v7.6 Hybrid Pipeline Controller ===")
+            log("=== v7.7 Hybrid Pipeline Controller ===")
             update_status("running", "starting pipeline")
 
             cleanup_invalid_failed_imports()
-            quarantine_failed_imports_global(PRELIB)
 
-            # NEW v7.6: Clear pre-library before each run so leftover files
-            # from previous runs (duplicates, unmatched, etc.) don't
-            # accumulate and fill the tmpfs. Must run AFTER quarantine so
-            # failed_imports are safely moved out first.
-            clear_prelibrary()
+            # Drain pre-library at startup: give leftover files from the
+            # previous run one more import attempt before clearing.
+            # This replaces the v7.6 plain clear_prelibrary() call.
+            log("[PRELIB] Draining pre-library leftovers before new run...")
+            drain_prelibrary("startup")
 
-            # FIX: Removed global_settle() as a hard gate. Previously the pipeline
-            # would block until ALL SLSKD transfers finished (threshold=0), meaning
-            # if you had 15 active downloads it would wait 30s between each check
-            # until the queue was completely empty -- potentially hours.
-            #
-            # This was unnecessary because process_artist() already does a
-            # per-artist artist_in_use() check using fuzzy matching against active
-            # transfer paths. Artists with no active downloads are safe to process
-            # immediately. We just need the current transfer list as a reference,
-            # not a guarantee the entire queue is empty.
-            #
-            # active_paths is refreshed per-artist inside the loop below so it
-            # stays current as downloads complete during a long pipeline run.
             log("[SLSKD] Fetching active transfers (non-blocking)...")
             active_paths_initial = slskd_active_transfers()
             if active_paths_initial:
@@ -477,10 +549,6 @@ def main():
                     log("[SKIP] Artist folder disappeared: %s" % artist)
                     continue
 
-                # FIX: Refresh active transfer list per-artist rather than using
-                # a stale snapshot captured once before the loop. A download that
-                # starts mid-run would not appear in the original snapshot, meaning
-                # a partially-downloaded folder could be processed incorrectly.
                 active_paths = slskd_active_transfers()
 
                 try:
@@ -497,7 +565,7 @@ def main():
             trigger_subsonic_scan_from_config()
             trigger_volumio_rescan()
 
-            log("=== v7.6 Pipeline Finished ===")
+            log("=== v7.7 Pipeline Finished ===")
             update_status("success", "pipeline finished")
 
     except RuntimeError as e:
