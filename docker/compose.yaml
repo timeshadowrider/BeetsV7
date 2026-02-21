@@ -9,8 +9,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 4g
+          cpus: "3.0"
+          memory: 12g
 
     networks:
       - media-bridge
@@ -37,12 +37,12 @@ services:
       - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/static:/app/static:ro
       - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/public:/app/public:ro
 
-      # config + data
+      # config + data (persistent - stays on NVME)
       - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/config:/config:rw
       - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/data:/data:rw
 
       # pipeline volumes
-      - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/pre-library:/pre-library
+      # NOTE: /pre-library is now tmpfs (see below) - removed from here
       - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/clean:/music/library
       - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Downloads/Audio:/inbox
       - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/quarantine:/music/quarantine
@@ -51,8 +51,17 @@ services:
       - ../backend:/app/backend:rw
       - ../scripts:/app/scripts:rw
 
-      # timezone sync (optional but recommended)
+      # timezone sync
       - /etc/localtime:/etc/localtime:ro
+
+    # RAM-backed tmpfs mounts
+    # /pre-library: staging area for files before beets import - 6GB covers large album batches
+    #   Files only live here for seconds/minutes, loss on restart is safe (reprocess from inbox)
+    # /tmp/pipeline-work: scratch space for fingerprints.json and pipeline working files - 1GB
+    #   fingerprint_all.py writes/rewrites fingerprints.json constantly during import runs
+    tmpfs:
+      - /pre-library:size=6g,mode=0755,uid=1000,gid=1000
+      - /tmp/pipeline-work:size=1g,mode=0755,uid=1000,gid=1000
 
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:7080/api/stats || exit 1"]

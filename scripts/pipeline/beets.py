@@ -6,14 +6,16 @@ Beets Integration Module - v7.5
 Changes from v7.4:
 - run_beets_import: added --log flag so beets writes per-import rejection
   reasons to /data/last_beets_imports.log (separate from pipeline.log)
-- run_post_import: broadened 'added:-1h..' to 'added:-24h..' so imports
-  that take longer than one hour are still caught by the update/move pass
+- run_post_import: broadened query window to 24h but uses a proper
+  ISO timestamp (added:-24h.. is not valid beets syntax -- beets requires
+  a real date like added:2026-02-19.. derived from time.time())
 - verify_import_success: now also warns when failed_imports count > 0,
   and points to BEETS_IMPORT_LOG for diagnosis
 """
 from .util import run, PRELIB, LIBRARY
 from .logging import vlog, log
 from pathlib import Path
+import time
 
 # FIX: These are suffix patterns for Path.suffix comparisons, NOT glob patterns.
 # Use lowercase extensions with leading dot, not "*.flac" glob syntax.
@@ -83,18 +85,25 @@ def run_post_import():
     """
     Post-import updates scoped to recently added files.
 
-    FIX: Broadened query from 'added:-1h..' to 'added:-24h..' to catch
-    imports from long-running sessions that exceed the 1-hour window.
-    A large import batch (hundreds of albums) can easily take 2-4 hours,
-    meaning everything before the last hour was silently missing the
-    update/move pass and left with incorrect paths or stale metadata.
+    FIX: 'added:-24h..' is not valid beets query syntax -- beets requires
+    a real ISO date string, not a relative offset. We derive a date string
+    from 24 hours ago at runtime so the query is always valid:
+        added:2026-02-19..
+    This catches everything imported in the last 24 hours regardless of
+    how long the pipeline run took.
     """
     vlog("[BEETS] Post-import update/move...")
     try:
-        vlog("[BEETS] Updating recently imported files (24h window)...")
-        run(["beet", "update", "added:-24h.."])
-        vlog("[BEETS] Ensuring files are in correct location (24h window)...")
-        run(["beet", "move", "added:-24h.."])
+        # Build a valid beets date query: YYYY-MM-DD for 24 hours ago
+        since = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+        date_query = "added:%s.." % since
+
+        vlog("[BEETS] Updating recently imported files (%s)..." % date_query)
+        run(["beet", "update", date_query])
+
+        vlog("[BEETS] Ensuring files are in correct location (%s)..." % date_query)
+        run(["beet", "move", date_query])
+
         vlog("[BEETS] Post-import completed")
     except Exception as e:
         log("[BEETS] Post-import warning: %s" % e)

@@ -227,22 +227,40 @@ def clear_volumio_log():
 # Volumio Playlist Builder (Spotify CSV -> Volumio WebSocket)
 # =============================================================
 
-def _strip_diacritics(s: str) -> str:
-    """Remove diacritics/accents: BØRNS -> BORNS, Sigur Rós -> Sigur Ros, etc."""
-    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+import re as _re
+
+
+def _normalize(s: str) -> str:
+    """
+    Normalize a string for both querying and comparison:
+    - Strip diacritics (BORNS -> BORNS, Seniorita -> Seniorita)
+    - Lowercase
+    - Remove punctuation except spaces
+    e.g. "BORNS" -> "borns", "fun." -> "fun", "Camila Cabello" -> "camila cabello"
+    """
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = _re.sub(r"[^a-z0-9 ]", "", s.lower())
+    return s.strip()
+
+
+def _primary_artist(artist: str) -> str:
+    """Return first artist from a multi-artist CSV string like 'Luis Fonsi;Daddy Yankee'."""
+    return artist.replace(";", ",").split(",")[0].strip()
 
 
 def _beet_query(title: str, artist: str = "") -> str | None:
     """
-    Run a single beet ls query using shell=True so that quoting behaves
-    identically to the interactive terminal (double-quoted args handle
-    spaces and Unicode correctly).
+    Run beet ls with normalized title and artist so diacritics and punctuation
+    differences between Spotify CSV and beets tags do not cause misses.
+    Both sides are normalized before querying.
     Returns the first matched path, or None.
     """
+    norm_title = _normalize(title)
     if artist:
-        cmd = f'beet ls -p title:"{title}" artist:"{artist}"'
+        norm_artist = _normalize(artist)
+        cmd = f'beet ls -p title:"{norm_title}" artist:"{norm_artist}"'
     else:
-        cmd = f'beet ls -p title:"{title}"'
+        cmd = f'beet ls -p title:"{norm_title}"'
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
         lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
@@ -252,46 +270,85 @@ def _beet_query(title: str, artist: str = "") -> str | None:
         return None
 
 
+def _artist_matches(beets_path: str, expected_artist: str) -> bool:
+    """
+    Verify the matched file belongs to the expected artist by extracting the
+    artist folder name from the path and comparing it against ALL artists in
+    the semicolon-separated CSV artist string (not just the primary).
+
+    Path format: /music/library/Artist Name/(year) Album/track.flac
+    The first path segment after /music/library/ is always the artist folder.
+
+    Checks all listed artists so that e.g. a track credited to
+    "The Chainsmokers;ILLENIUM;Lennon Stella" correctly matches a file
+    stored under the ILLENIUM folder.
+    """
+    if not expected_artist:
+        return True
+
+    # Extract artist folder name from path
+    parts = beets_path.replace("/music/library/", "").split("/")
+    path_artist = parts[0] if parts else ""
+    norm_path = _normalize(path_artist)
+
+    if not norm_path:
+        volumio_logger.warning(f"[VOLUMIO] Could not extract artist from path: {beets_path}")
+        return False
+
+    # Check against every artist in the CSV (split on ; or ,)
+    all_artists = [a.strip() for a in expected_artist.replace(";", ",").split(",") if a.strip()]
+    for candidate in all_artists:
+        norm_candidate = _normalize(candidate)
+        if norm_candidate in norm_path or norm_path in norm_candidate:
+            volumio_logger.info(
+                f"[VOLUMIO] Artist verified: path='{path_artist}' matches candidate='{candidate}'"
+            )
+            return True
+
+    volumio_logger.warning(
+        f"[VOLUMIO] Artist mismatch: path='{path_artist}' not in {all_artists} for {beets_path}"
+    )
+    return False
+
+
 def _search_beets_for_track(title: str, artist: str) -> str | None:
     """
-    Four-pass search for maximum match rate:
+    Three-pass search. All queries use normalized title+artist so diacritics
+    and punctuation differences are handled consistently on both sides.
 
-    Pass 1 – exact title + exact artist         e.g. "Electric Love" / "BØRNS"
-    Pass 2 – exact title + diacritic-stripped   e.g. "Electric Love" / "BORNS"
-             (only attempted when artist contains non-ASCII)
-    Pass 3 – exact title + first artist only    e.g. "Electric Love" / "Luis Fonsi"
-             (handles CSV multi-artist "Luis Fonsi;Daddy Yankee")
-    Pass 4 – title only                         last-resort fallback
+    Pass 1 - normalized title + normalized full artist
+             e.g. "electric love" / "borns"  (handles BORNS -> borns)
+    Pass 2 - normalized title + normalized primary artist only
+             e.g. "electric love" / "luis fonsi"
+             (handles multi-artist CSV strings like "Luis Fonsi;Daddy Yankee")
+    Pass 3 - normalized title only, accepted ONLY if artist tag loosely matches
+             (last-resort for edge cases; rejects wrong-artist hits like
+             Garbage's "When I Grow Up" when expecting Pussycat Dolls)
     """
     volumio_logger.info(f"[VOLUMIO] Searching: '{artist} - {title}'")
 
-    # Pass 1: exact
+    # Pass 1: normalized title + normalized full artist
     path = _beet_query(title, artist)
     if path:
-        volumio_logger.info(f"[VOLUMIO] MATCH pass1 (exact): {path}")
+        volumio_logger.info(f"[VOLUMIO] MATCH pass1 (full artist): {path}")
         return path
 
-    # Pass 2: diacritic-stripped artist (BØRNS -> BORNS)
-    artist_ascii = _strip_diacritics(artist)
-    if artist_ascii != artist:
-        path = _beet_query(title, artist_ascii)
+    # Pass 2: normalized title + normalized primary artist (first of multi-artist)
+    primary = _primary_artist(artist)
+    if primary != artist and primary:
+        path = _beet_query(title, primary)
         if path:
-            volumio_logger.info(f"[VOLUMIO] MATCH pass2 (ascii artist): {path}")
+            volumio_logger.info(f"[VOLUMIO] MATCH pass2 (primary artist): {path}")
             return path
 
-    # Pass 3: first artist only (split on ; or ,)
-    artist_primary = artist.replace(";", ",").split(",")[0].strip()
-    if artist_primary != artist and artist_primary:
-        path = _beet_query(title, artist_primary)
-        if path:
-            volumio_logger.info(f"[VOLUMIO] MATCH pass3 (primary artist): {path}")
-            return path
-
-    # Pass 4: title only
+    # Pass 3: title only, but verify artist before accepting
     path = _beet_query(title)
     if path:
-        volumio_logger.info(f"[VOLUMIO] MATCH pass4 (title only): {path}")
-        return path
+        if _artist_matches(path, artist):
+            volumio_logger.info(f"[VOLUMIO] MATCH pass3 (title+artist verified): {path}")
+            return path
+        else:
+            volumio_logger.warning(f"[VOLUMIO] REJECTED pass3 (wrong artist): {path}")
 
     volumio_logger.warning(f"[VOLUMIO] NO MATCH: '{artist} - {title}'")
     return None

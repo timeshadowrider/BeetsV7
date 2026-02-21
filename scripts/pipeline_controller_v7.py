@@ -38,7 +38,7 @@ from scripts.pipeline.quarantine import quarantine_failed_imports_global
 from scripts.pipeline.regenerate import generate_ui_json
 
 
-CHUNK_SIZE = 100
+CHUNK_SIZE = 500
 LOCK_FILE = Path("/data/pipeline.lock")
 
 
