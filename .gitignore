@@ -66,3 +66,18 @@ Thumbs.db
 node_modules/
 dist/
 build/
+
+# Logs
+data/*.log
+data/*.log.1
+data/pipeline_status.json
+data/pipeline.lock
+
+# Beets database and fingerprints
+data/library.db
+data/fingerprints.json
+
+# Beets import log
+data/last_beets_imports.log
+data/metadata_refresh.log
+data/discogs_bulk_tag.log
