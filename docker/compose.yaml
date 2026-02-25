@@ -6,6 +6,9 @@ services:
     container_name: beetsV7
     restart: unless-stopped
 
+    env_file:
+      - .env
+
     deploy:
       resources:
         limits:
@@ -16,21 +19,55 @@ services:
       - media-bridge
 
     ports:
-      - "7080:7080"
+      - "${APP_PORT}:${APP_PORT}"
       - "8337:8337"
 
     environment:
       BEETSDIR: /config
       BEETS_LIBRARY: /data/library.db
-      APP_PORT: "7080"
+      APP_PORT: "${APP_PORT}"
       INBOX_DIR: /inbox
-      VOLUMIO_URL: "http://10.0.0.102"
-      VOLUMIO_MUSIC_MOUNT: "INTERNAL"
-      TZ: America/Los_Angeles
-      PUID: 1000
-      PGID: 1000
+      TZ: "${TZ}"
+      PUID: "${PUID}"
+      PGID: "${PGID}"
 
-    user: "1000:1000"
+      # Pipeline schedulers
+      PIPELINE_MODE: "${PIPELINE_MODE}"
+      PIPELINE_INTERVAL_MINUTES: "${PIPELINE_INTERVAL_MINUTES}"
+      METADATA_REFRESH_MODE: "${METADATA_REFRESH_MODE}"
+      METADATA_REFRESH_TIME: "${METADATA_REFRESH_TIME}"
+      METADATA_REFRESH_INTERVAL_HOURS: "${METADATA_REFRESH_INTERVAL_HOURS}"
+      DISCOGS_REFRESH_MODE: "${DISCOGS_REFRESH_MODE}"
+      DISCOGS_REFRESH_TIME: "${DISCOGS_REFRESH_TIME}"
+      DISCOGS_REFRESH_DAY: "${DISCOGS_REFRESH_DAY}"
+      REGEN_INTERVAL_MINUTES: "${REGEN_INTERVAL_MINUTES}"
+      REGEN_WITH_METADATA: "${REGEN_WITH_METADATA}"
+      METADATA_REFRESH_QUICK: "${METADATA_REFRESH_QUICK}"
+
+      # External service endpoints + credentials
+      VOLUMIO_HOST: "${VOLUMIO_HOST}"
+      VOLUMIO_URL: "${VOLUMIO_URL}"
+      VOLUMIO_MUSIC_MOUNT: "${VOLUMIO_MUSIC_MOUNT}"
+      VOLUMIO_MPD_HOST: "${VOLUMIO_MPD_HOST}"
+      VOLUMIO_MPD_PORT: "${VOLUMIO_MPD_PORT}"
+      SLSKD_HOST: "${SLSKD_HOST}"
+      SLSKD_API_KEY: "${SLSKD_API_KEY}"
+      SABNZBD_URL: "${SABNZBD_URL}"
+      SABNZBD_API_KEY: "${SABNZBD_API_KEY}"
+      PLEX_HOST: "${PLEX_HOST}"
+      PLEX_PORT: "${PLEX_PORT}"
+      PLEX_TOKEN: "${PLEX_TOKEN}"
+      SUBSONIC_HOST: "${SUBSONIC_HOST}"
+      SUBSONIC_PORT: "${SUBSONIC_PORT}"
+      SUBSONIC_USER: "${SUBSONIC_USER}"
+      SUBSONIC_PASSWORD: "${SUBSONIC_PASSWORD}"
+      DISCOGS_TOKEN: "${DISCOGS_TOKEN}"
+      LASTFM_KEY: "${LASTFM_KEY}"
+      FANARTTV_KEY: "${FANARTTV_KEY}"
+      ACOUSTID_APIKEY: "${ACOUSTID_APIKEY}"
+      GENIUS_API_KEY: "${GENIUS_API_KEY}"
+
+    user: "${PUID}:${PGID}"
 
     volumes:
       # static + public
@@ -42,29 +79,23 @@ services:
       - /srv/dev-disk-by-uuid-306c14f2-0239-4b1e-8775-915dfdd88bd0/NVME/Docket_Configs/Beets-v7/data:/data:rw
 
       # pipeline volumes
-      # NOTE: /pre-library is now tmpfs (see below) - removed from here
       - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/clean:/music/library
       - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Downloads/Audio:/inbox
       - /srv/dev-disk-by-uuid-901efa52-2e9a-4fdd-a53c-08b891fb8458/SnapRaid_mergerfs/Beets-Flask/quarantine:/music/quarantine
 
-      # backend + scripts
+      # backend + scripts (live-reload)
       - ../backend:/app/backend:rw
       - ../scripts:/app/scripts:rw
 
       # timezone sync
       - /etc/localtime:/etc/localtime:ro
 
-    # RAM-backed tmpfs mounts
-    # /pre-library: staging area for files before beets import - 6GB covers large album batches
-    #   Files only live here for seconds/minutes, loss on restart is safe (reprocess from inbox)
-    # /tmp/pipeline-work: scratch space for fingerprints.json and pipeline working files - 1GB
-    #   fingerprint_all.py writes/rewrites fingerprints.json constantly during import runs
     tmpfs:
-      - /pre-library:size=8g,mode=0755,uid=1000,gid=1000
+      - /pre-library:size=6g,mode=0755,uid=1000,gid=1000
       - /tmp/pipeline-work:size=1g,mode=0755,uid=1000,gid=1000
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:7080/api/ui/stats/library || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:${APP_PORT}/api/ui/stats/library || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

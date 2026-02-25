@@ -18,7 +18,11 @@ MUSIC_DIR = Path("/music/library")
 LOG_PIPELINE = DATA_DIR / "pipeline_verbose.log"
 LOG_BEETS = DATA_DIR / "last_beets_imports.log"
 LOG_VOLUMIO = DATA_DIR / "volumio_playlist.log"
-VOLUMIO_HOST = "http://10.0.0.102:3000"
+
+VOLUMIO_HOST = os.getenv("VOLUMIO_HOST", "http://10.0.0.102:3000")
+SLSKD_HOST   = os.getenv("SLSKD_HOST",   "http://10.0.0.100:5030")
+SLSKD_API_KEY = os.getenv("SLSKD_API_KEY", "")
+SLSKD_HEADERS = {"X-API-Key": SLSKD_API_KEY}
 
 # ---------------------------------------------------------
 # Volumio-specific file logger
@@ -231,30 +235,16 @@ import re as _re
 
 
 def _normalize(s: str) -> str:
-    """
-    Normalize a string for both querying and comparison:
-    - Strip diacritics (BORNS -> BORNS, Seniorita -> Seniorita)
-    - Lowercase
-    - Remove punctuation except spaces
-    e.g. "BORNS" -> "borns", "fun." -> "fun", "Camila Cabello" -> "camila cabello"
-    """
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     s = _re.sub(r"[^a-z0-9 ]", "", s.lower())
     return s.strip()
 
 
 def _primary_artist(artist: str) -> str:
-    """Return first artist from a multi-artist CSV string like 'Luis Fonsi;Daddy Yankee'."""
     return artist.replace(";", ",").split(",")[0].strip()
 
 
 def _beet_query(title: str, artist: str = "") -> str | None:
-    """
-    Run beet ls with normalized title and artist so diacritics and punctuation
-    differences between Spotify CSV and beets tags do not cause misses.
-    Both sides are normalized before querying.
-    Returns the first matched path, or None.
-    """
     norm_title = _normalize(title)
     if artist:
         norm_artist = _normalize(artist)
@@ -271,31 +261,14 @@ def _beet_query(title: str, artist: str = "") -> str | None:
 
 
 def _artist_matches(beets_path: str, expected_artist: str) -> bool:
-    """
-    Verify the matched file belongs to the expected artist by extracting the
-    artist folder name from the path and comparing it against ALL artists in
-    the semicolon-separated CSV artist string (not just the primary).
-
-    Path format: /music/library/Artist Name/(year) Album/track.flac
-    The first path segment after /music/library/ is always the artist folder.
-
-    Checks all listed artists so that e.g. a track credited to
-    "The Chainsmokers;ILLENIUM;Lennon Stella" correctly matches a file
-    stored under the ILLENIUM folder.
-    """
     if not expected_artist:
         return True
-
-    # Extract artist folder name from path
     parts = beets_path.replace("/music/library/", "").split("/")
     path_artist = parts[0] if parts else ""
     norm_path = _normalize(path_artist)
-
     if not norm_path:
         volumio_logger.warning(f"[VOLUMIO] Could not extract artist from path: {beets_path}")
         return False
-
-    # Check against every artist in the CSV (split on ; or ,)
     all_artists = [a.strip() for a in expected_artist.replace(";", ",").split(",") if a.strip()]
     for candidate in all_artists:
         norm_candidate = _normalize(candidate)
@@ -304,7 +277,6 @@ def _artist_matches(beets_path: str, expected_artist: str) -> bool:
                 f"[VOLUMIO] Artist verified: path='{path_artist}' matches candidate='{candidate}'"
             )
             return True
-
     volumio_logger.warning(
         f"[VOLUMIO] Artist mismatch: path='{path_artist}' not in {all_artists} for {beets_path}"
     )
@@ -312,28 +284,13 @@ def _artist_matches(beets_path: str, expected_artist: str) -> bool:
 
 
 def _search_beets_for_track(title: str, artist: str) -> str | None:
-    """
-    Three-pass search. All queries use normalized title+artist so diacritics
-    and punctuation differences are handled consistently on both sides.
-
-    Pass 1 - normalized title + normalized full artist
-             e.g. "electric love" / "borns"  (handles BORNS -> borns)
-    Pass 2 - normalized title + normalized primary artist only
-             e.g. "electric love" / "luis fonsi"
-             (handles multi-artist CSV strings like "Luis Fonsi;Daddy Yankee")
-    Pass 3 - normalized title only, accepted ONLY if artist tag loosely matches
-             (last-resort for edge cases; rejects wrong-artist hits like
-             Garbage's "When I Grow Up" when expecting Pussycat Dolls)
-    """
     volumio_logger.info(f"[VOLUMIO] Searching: '{artist} - {title}'")
 
-    # Pass 1: normalized title + normalized full artist
     path = _beet_query(title, artist)
     if path:
         volumio_logger.info(f"[VOLUMIO] MATCH pass1 (full artist): {path}")
         return path
 
-    # Pass 2: normalized title + normalized primary artist (first of multi-artist)
     primary = _primary_artist(artist)
     if primary != artist and primary:
         path = _beet_query(title, primary)
@@ -341,7 +298,6 @@ def _search_beets_for_track(title: str, artist: str) -> str | None:
             volumio_logger.info(f"[VOLUMIO] MATCH pass2 (primary artist): {path}")
             return path
 
-    # Pass 3: title only, but verify artist before accepting
     path = _beet_query(title)
     if path:
         if _artist_matches(path, artist):
@@ -362,10 +318,6 @@ def _path_to_volumio_uri(abs_path: str) -> str:
 
 
 async def _push_playlist_via_socket(playlist_name: str, entries: list) -> int:
-    """
-    Push playlist to Volumio using socket.io (Volumio 4 event names).
-    createPlaylist + addToPlaylist are the correct Volumio 4 events.
-    """
     import socketio
 
     sio = socketio.AsyncClient(logger=False, engineio_logger=False)
@@ -378,7 +330,6 @@ async def _push_playlist_via_socket(playlist_name: str, entries: list) -> int:
         connected = True
         volumio_logger.info("[VOLUMIO] WebSocket connected")
 
-        # Delete existing playlist if it exists, then create fresh
         await sio.emit("deletePlaylist", {"name": playlist_name})
         await asyncio.sleep(0.5)
 
@@ -386,7 +337,6 @@ async def _push_playlist_via_socket(playlist_name: str, entries: list) -> int:
         await asyncio.sleep(0.5)
         volumio_logger.info(f"[VOLUMIO] Created playlist '{playlist_name}'")
 
-        # Add each track using Volumio 4 addToPlaylist event
         for entry in entries:
             await sio.emit("addToPlaylist", {
                 "name": playlist_name,
@@ -399,7 +349,6 @@ async def _push_playlist_via_socket(playlist_name: str, entries: list) -> int:
             await asyncio.sleep(0.15)
             volumio_logger.info(f"[VOLUMIO] Added: {entry['title']} by {entry['artist']}")
 
-        # Give Volumio a moment to persist
         await asyncio.sleep(1.0)
         volumio_logger.info(f"[VOLUMIO] All {len(entries)} tracks sent via WebSocket")
 
@@ -415,15 +364,9 @@ async def _push_playlist_via_socket(playlist_name: str, entries: list) -> int:
 
 @router.post("/volumio/playlist/upload")
 async def build_volumio_playlist(file: UploadFile = File(...)):
-    """
-    Accept a Spotify CSV, match tracks against Beets,
-    push playlist to Volumio via WebSocket (socket.io).
-    """
-    # Clear log for fresh run
     LOG_VOLUMIO.write_text("", encoding="utf-8")
     volumio_logger.info(f"[VOLUMIO] === New build: {file.filename} ===")
 
-    # 1. Parse CSV
     contents = await file.read()
     try:
         text = contents.decode("utf-8-sig")
@@ -435,7 +378,6 @@ async def build_volumio_playlist(file: UploadFile = File(...)):
     if not rows:
         raise HTTPException(400, "CSV file is empty")
 
-    # 2. Auto-detect columns
     sample = rows[0]
     cols = list(sample.keys())
     volumio_logger.info(f"[VOLUMIO] CSV columns: {cols}")
@@ -453,7 +395,6 @@ async def build_volumio_playlist(file: UploadFile = File(...)):
     volumio_logger.info(f"[VOLUMIO] Columns: title='{title_col}' artist='{artist_col}' album='{album_col}'")
     volumio_logger.info(f"[VOLUMIO] {len(rows)} tracks to process...")
 
-    # 3. Match each track against Beets
     playlist_name = file.filename.replace(".csv", "").replace("_", " ")
     playlist_entries = []
     unmatched = []
@@ -488,7 +429,6 @@ async def build_volumio_playlist(file: UploadFile = File(...)):
             "message": "No tracks from the CSV were found in your Beets library.",
         }
 
-    # 4. Push to Volumio via WebSocket
     volumio_logger.info(f"[VOLUMIO] Pushing {len(playlist_entries)} tracks as '{playlist_name}'...")
     errors = await _push_playlist_via_socket(playlist_name, playlist_entries)
 
@@ -507,7 +447,6 @@ async def build_volumio_playlist(file: UploadFile = File(...)):
 
 @router.get("/volumio/playlists")
 def list_volumio_playlists():
-    """List playlists Volumio knows about via REST API."""
     import httpx
     try:
         resp = httpx.get(f"{VOLUMIO_HOST}/api/v1/listplaylists", timeout=5.0)
@@ -515,21 +454,13 @@ def list_volumio_playlists():
     except Exception as e:
         raise HTTPException(502, f"Cannot reach Volumio: {e}")
 
+
 # =============================================================
 # SLSKD Proxy Routes
-# Proxies SLSKD API calls from the frontend to avoid CORS issues.
-# The browser cannot call SLSKD directly cross-origin, so all
-# requests are tunnelled through this FastAPI backend.
 # =============================================================
-
-SLSKD_HOST    = "http://10.0.0.100:5030"
-SLSKD_API_KEY = "PV1RixwWGOi91oVYfSMhd7JNVy1hj6jpcBOcdM+z1mKB+JnIQ2c4nwVWLgYi2JHd"
-SLSKD_HEADERS = {"X-API-Key": SLSKD_API_KEY}
-
 
 @router.post("/slskd/searches")
 async def slskd_search_proxy(payload: dict):
-    """Initiate a SLSKD search and return the search object (with id)."""
     import httpx
     try:
         async with httpx.AsyncClient() as client:
@@ -547,7 +478,6 @@ async def slskd_search_proxy(payload: dict):
 
 @router.get("/slskd/searches/{search_id}")
 async def slskd_poll_proxy(search_id: str):
-    """Poll a SLSKD search state (isComplete, fileCount). Does NOT contain file results."""
     import httpx
     try:
         async with httpx.AsyncClient() as client:
@@ -564,7 +494,6 @@ async def slskd_poll_proxy(search_id: str):
 
 @router.get("/slskd/searches/{search_id}/responses")
 async def slskd_responses_proxy(search_id: str):
-    """Get the actual file results for a completed SLSKD search (separate endpoint from state)."""
     import httpx
     try:
         async with httpx.AsyncClient() as client:
@@ -581,7 +510,6 @@ async def slskd_responses_proxy(search_id: str):
 
 @router.post("/slskd/downloads/{username}")
 async def slskd_download_proxy(username: str, request: Request):
-    """Queue a download on SLSKD. Pass raw body straight through to preserve backslashes."""
     import httpx
     try:
         raw_body = await request.body()
@@ -599,7 +527,6 @@ async def slskd_download_proxy(username: str, request: Request):
 
 @router.get("/slskd/transfers")
 async def slskd_transfers_proxy():
-    """Return current SLSKD download transfers (for active transfer count)."""
     import httpx
     try:
         async with httpx.AsyncClient() as client:

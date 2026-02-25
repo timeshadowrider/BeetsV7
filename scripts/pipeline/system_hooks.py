@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import subprocess
 import requests
 
 from .util import LIBRARY
 from .logging import log
 
+SUBSONIC_HOST     = os.getenv("SUBSONIC_HOST",     "http://10.0.0.100")
+SUBSONIC_PORT     = os.getenv("SUBSONIC_PORT",     "4533")
+SUBSONIC_USER     = os.getenv("SUBSONIC_USER",     "")
+SUBSONIC_PASSWORD = os.getenv("SUBSONIC_PASSWORD", "")
+
+VOLUMIO_MPD_HOST  = os.getenv("VOLUMIO_MPD_HOST",  "10.0.0.102")
+
 
 def fix_library_permissions():
-    """
-    FIX: chown runs as appuser (uid 1000) which can only chown files it owns.
-    Removed chown - it would silently fail or error on files owned by root.
-    chmod is sufficient and works for owned files.
-    """
     try:
         log("[PERMISSIONS] Fixing library permissions...")
         subprocess.run(
@@ -32,13 +35,14 @@ def fix_library_permissions():
 
 
 def trigger_subsonic_scan_from_config():
-    host = "http://10.0.0.100"
-    port = 4533
-    user = "timeshadowrider"
-    password = "An|t@theR@bb|t"
-    url = "%s:%s/rest/startScan" % (host, port)
-
-    params = {"u": user, "p": password, "v": "1.13.0", "c": "beets", "f": "json"}
+    url = "%s:%s/rest/startScan" % (SUBSONIC_HOST, SUBSONIC_PORT)
+    params = {
+        "u": SUBSONIC_USER,
+        "p": SUBSONIC_PASSWORD,
+        "v": "1.13.0",
+        "c": "beets",
+        "f": "json",
+    }
 
     try:
         log("[SUBSONIC] Triggering Navidrome scan at %s" % url)
@@ -51,10 +55,6 @@ def trigger_subsonic_scan_from_config():
 
 
 def trigger_volumio_rescan():
-    """
-    FIX: Added timeout to subprocess.run to prevent indefinite blocking
-    if Volumio is unreachable.
-    """
     try:
         log("[VOLUMIO] Triggering Volumio rescan...")
         result = subprocess.run(
@@ -62,7 +62,7 @@ def trigger_volumio_rescan():
              "-o", "ConnectTimeout=10",
              "-o", "StrictHostKeyChecking=no",
              "-o", "BatchMode=yes",
-             "volumio@10.0.0.102",
+             "volumio@%s" % VOLUMIO_MPD_HOST,
              "volumio", "rescan"],
             check=False,
             timeout=30,

@@ -2,15 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 SLSKD Integration Module - v7.4
-
-Fixes:
-- Added 'queued' to active states so queued downloads block processing
-- Added 'requested' state coverage
-- Completed transfers correctly excluded by checking for 'completed' in state
-- global_settle threshold reduced to 0 (no active downloads before processing)
-- Better state logging for debugging
 """
 
+import os
 import time
 import requests
 from pathlib import Path
@@ -19,38 +13,26 @@ from .util import INBOX
 from .fuzzy import tokenize, fuzzy_match
 
 
-SLSKD_RETRY_DELAYS = [2, 4, 8]
+SLSKD_API_KEY = os.getenv("SLSKD_API_KEY", "")
+SLSKD_HOST    = os.getenv("SLSKD_HOST",    "http://10.0.0.100:5030")
 
-# Wait until ALL downloads are done before processing
-# Set to 0 for strictest safety - no active downloads at all
-# Set higher (e.g. 3) if you want to allow a few queued/slow downloads
+SLSKD_RETRY_DELAYS = [2, 4, 8]
 SLSKD_GLOBAL_THRESHOLD = 0
 SLSKD_GLOBAL_WAIT = 30
 
-SLSKD_API_KEY = "PV1RixwWGOi91oVYfSMhd7JNVy1hj6jpcBOcdM+z1mKB+JnIQ2c4nwVWLgYi2JHd"
-SLSKD_HOST = "http://10.0.0.100:5030"
-
-# States that mean a transfer is still in progress
-# SLSKD returns compound flag strings like "InProgress" or "Requested, Initializing"
-# We check substrings after lowercasing
 ACTIVE_STATES = {
     "requested",
     "initializing",
     "inprogress",
-    "queued",        # FIX: waiting in remote queue counts as active
+    "queued",
 }
 
-# States that mean a transfer is finished - exclude these
 TERMINAL_STATES = {
     "completed",
 }
 
 
 def slskd_get_transfers():
-    """
-    Get downloads from SLSKD API.
-    Returns list of user objects with transfer data, or empty list on failure.
-    """
     url = "{}/api/v0/transfers/downloads".format(SLSKD_HOST)
     headers = {"X-API-Key": SLSKD_API_KEY}
 
@@ -92,15 +74,6 @@ def slskd_get_transfers():
 
 
 def slskd_active_transfers():
-    """
-    Get list of active (non-completed) transfer filenames.
-
-    FIX: Now correctly handles SLSKD compound state strings and
-    excludes completed transfers. Also counts queued transfers as active.
-
-    Returns:
-        list: File paths that are currently active (downloading or queued)
-    """
     transfers = slskd_get_transfers()
     if not transfers:
         return []
@@ -119,11 +92,9 @@ def slskd_active_transfers():
                 state = raw_state.lower()
                 filename = file.get("filename", "")
 
-                # Skip if terminal (completed, failed, cancelled)
                 if any(t in state for t in TERMINAL_STATES):
                     continue
 
-                # Count if any active state substring matches
                 if any(s in state for s in ACTIVE_STATES):
                     if filename:
                         active.append(filename)
@@ -137,16 +108,7 @@ def slskd_active_transfers():
 
 
 def global_settle():
-    """
-    Wait until SLSKD has no active or queued transfers.
-
-    FIX: threshold reduced to 0 - pipeline only runs when fully idle.
-    Includes 10 minute timeout to prevent infinite blocking on stuck queues.
-
-    Returns:
-        list: Active transfer paths (should be empty when this returns)
-    """
-    max_wait_time = 600  # 10 minute timeout
+    max_wait_time = 600
     start_time = time.time()
 
     while True:
@@ -174,12 +136,6 @@ def global_settle():
 
 
 def artist_in_use(artist_folder: Path, active_paths):
-    """
-    Check if artist folder fuzzy-matches any active SLSKD transfer.
-
-    Returns:
-        bool: True if the folder matches an active transfer
-    """
     if not active_paths:
         return False
 

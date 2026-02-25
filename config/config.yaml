@@ -1,5 +1,7 @@
 # ============================================================================
 # BEETS CONFIGURATION - v7.5
+# API keys and credentials are read from environment variables.
+# Set them in your .env file (loaded by docker-compose).
 # ============================================================================
 
 directory: /music/library
@@ -17,7 +19,6 @@ paths:
   singleton: Non-Album/$artist/($year) Singles/$title
   comp: Compilations/($year) $album%if{$albumdisambig, [$albumdisambig]}/$track $title
 
-# Add this to config.yaml
 item_fields:
   albumartist_primary: ""
 
@@ -37,9 +38,7 @@ import:
   duplicate_action: skip
   timid: no
   autotag: yes
-  fingerprint: yes      # Uses chroma plugin (chromaprint) for AcoustID lookup
-                        # Identifies recordings by audio fingerprint so
-                        # compilations/remasters with bad tags still match
+  fingerprint: yes
   art: yes
   group_albums: yes
   resume: no
@@ -77,11 +76,6 @@ logging:
 
 # ----------------------------------------------------------------------------
 # PLUGINS
-# Note: subsonicupdate removed -- Navidrome scan is triggered directly via
-#       API call in system_hooks.py (trigger_subsonic_scan_from_config)
-# Note: chroma added -- provides AcoustID fingerprinting via chromaprint.
-#       Requires chromaprint/fpcalc to be installed in the container.
-#       Check with: docker exec beetsV7 fpcalc -version
 # ----------------------------------------------------------------------------
 plugins:
   - info
@@ -108,21 +102,15 @@ plugins:
 
 # ----------------------------------------------------------------------------
 # CHROMA (AcoustID fingerprinting)
-# Requires a free API key from https://acoustid.org/api-key
-# Without this key fingerprint: yes silently does nothing useful
 # ----------------------------------------------------------------------------
 chroma:
   auto: yes
 
 acoustid:
-  apikey: ToQiZOt39C
+  apikey: $ENV{ACOUSTID_APIKEY}
 
 # ----------------------------------------------------------------------------
 # INLINE METADATA NORMALIZATION
-# Named albumartist_clean/artist_clean NOT albumartist/artist.
-# Using the real field names shadows actual tags during MusicBrainz matching
-# causing collaborative artists like "Simon & Garfunkel" to be looked up
-# as just "Simon" and fail to find a match.
 # ----------------------------------------------------------------------------
 inline:
   albumartist_clean: |
@@ -161,8 +149,8 @@ fetchart:
   auto: yes
   art_filename: cover
   sources: [coverart, filesystem, lastfm, fanarttv]
-  lastfm_key: 91521efedd7bca03e6e8d4aa570eb61b
-  fanarttv_key: 7cf7143c127fe59f11836a438237b4cb
+  lastfm_key: $ENV{LASTFM_KEY}
+  fanarttv_key: $ENV{FANARTTV_KEY}
   store_source: yes
   cover_names: [cover, folder, front]
 
@@ -189,7 +177,7 @@ lastgenre:
 # DISCOGS
 # ----------------------------------------------------------------------------
 discogs:
-  user_token: nSxVRTjzwbgIxzManORnSuDCIUEqouNYUcKymrHv
+  user_token: $ENV{DISCOGS_TOKEN}
 
 # ----------------------------------------------------------------------------
 # LYRICS
@@ -197,22 +185,22 @@ discogs:
 lyrics:
   auto: yes
   sources: [genius, lrclib, google]
-  genius_api_key: "-nO5NHAXNudMKIa7syQBkGDjFWhfy1-v5dmYIGS76USKyqeMfvZZnV0-1dCtpHHg"
+  genius_api_key: $ENV{GENIUS_API_KEY}
 
 # ----------------------------------------------------------------------------
 # MPD
 # ----------------------------------------------------------------------------
 mpd:
-  host: 10.0.0.102
-  port: 6600
+  host: $ENV{VOLUMIO_MPD_HOST}
+  port: $ENV{VOLUMIO_MPD_PORT}
 
 # ----------------------------------------------------------------------------
 # PLEX
 # ----------------------------------------------------------------------------
 plex:
-  host: 10.0.0.100
-  port: 32400
-  token: rEn12-HUTx1TsfYDyDpz
+  host: $ENV{PLEX_HOST}
+  port: $ENV{PLEX_PORT}
+  token: $ENV{PLEX_TOKEN}
 
 # ----------------------------------------------------------------------------
 # SMART PLAYLISTS
