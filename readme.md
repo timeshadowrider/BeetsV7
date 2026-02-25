@@ -1,221 +1,280 @@
-?? Beets v7 — Event-Driven Music Ingestion Pipeline
-Automated, fault-tolerant, metadata-aware music processing for SABnzbd + SLSKD + Beets + Navidrome + Volumio
-Beets v7 is a fully automated, event-driven music ingestion pipeline designed for home-lab environments. It coordinates multiple services — SABnzbd, SLSKD, Beets, fingerprinting, Navidrome, and Volumio — to reliably ingest, normalize, fingerprint, tag, and organize music files with zero manual intervention.
+# BeetsV7
 
-This version includes a complete rewrite of the pipeline controller, improved stability, SLSKD API integration, album-aware processing, and a deterministic pre-library staging system.
+A self-hosted music library automation system built on [beets](https://beets.io/), running in Docker on OpenMediaVault. Manages a FLAC/MP3 library of 8,000+ tracks with automated ingestion, metadata enrichment, deduplication, and multi-player synchronization.
 
-?? Features
-Event-Driven Ingestion
-The pipeline automatically processes new music only when:
+---
 
-SABnzbd has finished the job
+## Overview
 
-SLSKD has finished downloading all files for that artist
+BeetsV7 is a hybrid pipeline that continuously watches an inbox folder, processes new music through a series of quality and safety checks, imports it into a organized library via beets, and notifies downstream media players. It integrates with SLSKD for automated downloads from Soulseek, Lidarr for library gap detection, and supports Plex, Navidrome, and Volumio as playback targets.
 
-The folder has “settled” (no writes for a configurable time window)
+---
 
-This prevents partial imports, corrupted metadata, and race conditions.
+## Architecture
 
-Pre-Library Staging (/pre-library)
-All incoming music is normalized and validated in a staging area before entering the canonical library:
+```
+Soulseek (SLSKD) 
+SABnzbd 
+Manual drops  /inbox  /pre-library (tmpfs)  /music/library
+                                         
+                                    beets import
+                                    fingerprint
+                                    dedup
+                                         
+                              Plex / Navidrome / Volumio
+```
 
-Album folders are created deterministically
+### Key Components
 
-Loose tracks are grouped by albumartist/album tags
+| Component | Description |
+|-----------|-------------|
+| `pipeline_controller_v7.py` | Main orchestrator — watches inbox, chunks albums into batches, drives the full import cycle |
+| `scripts/pipeline/` | Modular pipeline subsystems (moves, beets, metadata, cleanup, quarantine, etc.) |
+| `scripts/fingerprint_all.py` | AcoustID fingerprinting with mtime-based incremental scanning |
+| `scripts/beets_metadata_refresh.py` | Scheduled full metadata refresh (MusicBrainz, artwork, lyrics, genres) |
+| `scripts/discogs_bulk_tag.py` | Bulk Discogs tagger for format descriptions and primary artist consolidation |
+| `backend/` | FastAPI backend serving the web UI |
+| `public/` / `static/` | Web dashboard frontend |
 
-Large groups are chunked into batches
+---
 
-Fingerprinting is applied before import
+## Pipeline Flow
 
-Beets imports only clean, validated files
+Each pipeline run follows this sequence:
 
-Beets Integration
-Beets handles:
+1. **Lock** — file-based lock prevents concurrent runs; auto-clears stale locks from container restarts
+2. **Quarantine** — moves any `failed_imports` folders out of pre-library to `/music/quarantine`
+3. **Clear pre-library** — wipes the tmpfs pre-library so leftover files from previous runs don't accumulate
+4. **SLSKD check** — fetches active transfer list; artists with active downloads are skipped (re-checked per-artist)
+5. **Per-artist processing:**
+   - SABnzbd active job check
+   - Settle timer (5 minute grace period for new downloads)
+   - Junk file cleanup (NFO, CUE, logs, etc.)
+   - Corruption check on all audio files
+   - Move album folders  pre-library (tmpfs RAM disk)
+   - AcoustID fingerprinting
+   - beets import
+   - Post-import move/update scoped to last 24h
+6. **Permissions fix**, UI JSON regeneration, Navidrome scan trigger, Volumio rescan
 
-Metadata enrichment
+### Chunking
 
-Tag normalization
+Albums are processed in configurable chunks (`CHUNK_SIZE = 500`) with a fingerprint  import  post-process cycle per chunk. This keeps pre-library memory usage bounded on large artist backlogs.
 
-Moving files into /music/library
+---
 
-Updating existing library entries
+## Pre-library (tmpfs)
 
-The pipeline runs:
+`/pre-library` is a tmpfs RAM disk used as a staging area between inbox and library. Files are moved here before beets processes them, giving fast I/O during import.
 
-Code
-beet import
-beet update
-beet move
-in the correct order for deterministic results.
+**Important:** Pre-library is wiped at the start of every pipeline run. Files that beets rejects (duplicates, unmatched) are not preserved — Lidarr acts as the source of truth for missing albums and will re-queue anything that doesn't make it through.
 
-SLSKD Integration
-The pipeline uses the SLSKD API to detect active Soulseek transfers:
+Configure size in `docker-compose.yml`:
+```yaml
+tmpfs:
+  - /pre-library:size=8g
+```
 
-Code
-GET /api/v0/transfers
-Authentication is done via:
+Increase if you see `[Errno 28] No space left on device` errors during large batch imports.
 
-Code
-X-API-Key: <your-api-key>
-This prevents the pipeline from processing incomplete Soulseek downloads.
+---
 
-SABnzbd Integration
-The pipeline queries SABnzbd’s queue API to detect active jobs and match them to artist folders.
+## Metadata Enrichment
 
-Automatic Metadata Fingerprinting
-Every batch of files is fingerprinted using:
+### On Import
+- AcoustID fingerprinting before beets import
+- MusicBrainz matching (auto + as-is fallback)
+- Artwork fetching and embedding
 
-Code
-python3 /app/scripts/fingerprint_all.py
-This ensures accurate MusicBrainz matching during Beets import.
+### Nightly (3 AM)
+`beets_metadata_refresh.py` runs a full refresh cycle:
+1. Orphaned duplicate record cleanup (`.1.flac`, `.1.mp3` stale DB entries)
+2. Fingerprint unmatched tracks  MusicBrainz sync
+3. Move files to correct paths (post-mbsync renames)
+4. Fetch missing artwork  embed
+5. Fetch lyrics, update genres (Last.fm)
+6. Scrub/normalize metadata
+7. Smart playlist generation
+8. Notify Plex, Navidrome, MPD
 
-Automatic Library Refresh
-After each pipeline run:
+### Weekly (Sunday 4 AM)
+`discogs_bulk_tag.py` queries Discogs for each album and applies:
+- `albumdisambig` — meaningful format tags (Remastered, Deluxe Edition, etc.)
+- `albumartist_primary` — primary artist for path template consolidation
 
-Navidrome scan is triggered
+This ensures collaborative releases like `Gabry Ponte & Datura` are filed under `Gabry Ponte/` in the library while preserving the original credit in metadata.
 
-Volumio rescan is triggered
+---
 
-Library permissions are corrected
+## Safety Systems
 
-UI JSON is regenerated for the frontend
+### SLSKD Integration
+- Active transfers are checked before processing each artist folder
+- Fuzzy token matching prevents processing partially-downloaded folders
+- Transfer list is refreshed per-artist (not a stale startup snapshot)
+- 10-minute timeout prevents infinite blocking on stuck queues
 
-Quarantine System
-Any failed imports in /pre-library are automatically moved to:
+### SABnzbd Integration
+- Only blocks on genuinely active statuses (Downloading, Verifying, Extracting, etc.)
+- Paused/Failed/Completed jobs do not block processing
 
-Code
-/pre-library/failed_imports
-This prevents bad files from polluting the main library.
+### Settle Timer
+- Artist folders must be idle for 5 minutes before processing
+- Prevents importing mid-download files
 
-Verbose Logging + Status JSON
-The pipeline writes:
+### Corruption Check
+- Every audio file is checked for readability and minimum size before import
+- Corrupted files are moved to `/music/quarantine/failed_imports`
 
-pipeline.log — high-level events
+### Deduplication
+- Pre-library is scanned for duplicate audio using AcoustID fingerprints before import
+- Orphaned `.1.flac` / `.1.mp3` database records are cleaned up nightly
 
-pipeline_verbose.log — detailed debugging
+---
 
-pipeline_status.json — current state for the frontend
+## Library Organization
 
-?? Directory Structure
-Code
+```
+/music/library/
+  {albumartist_primary or albumartist}/
+    ({year}) {album}/
+      {track:02d} {title}.{ext}
+```
+
+Collaborative artists are grouped under the primary artist via the `albumartist_primary` custom beets field, populated by the Discogs tagger. The original `albumartist` credit is preserved in file metadata.
+
+---
+
+## Media Player Integration
+
+| Player | Integration |
+|--------|-------------|
+| Plex | `beet plexupdate` after import and metadata refresh |
+| Navidrome | REST API scan trigger (`/rest/startScan`) |
+| Volumio | SSH `volumio rescan` command |
+| MPD | `beet mpdupdate` |
+
+---
+
+## Web Dashboard
+
+A FastAPI + React dashboard is served on port `7080` providing:
+- Library stats (artists, albums, tracks, total duration)
+- Recently added albums with cover art
+- Pipeline status and current activity
+- Inbox and pre-library file counts
+
+UI JSON is regenerated incrementally every 15 minutes — only changed album folders are rescanned, making updates fast even on large libraries.
+
+---
+
+## Directory Structure
+
+```
 Beets-v7/
-+-- scripts/
-¦   +-- pipeline_controller_v7.py
-¦   +-- fingerprint_all.py
-¦   +-- regenerate_albums_v7.py
-¦   +-- cleanup_non_audio_files_v7.py
-+-- pipeline/
-¦   +-- quarantine.py
-¦   +-- regenerate.py
-+-- docker/
-¦   +-- Dockerfile
-¦   +-- compose.yaml
-+-- volumes/
-    +-- inbox/
-    +-- pre-library/
-    +-- music/library/
-    +-- quarantine/
-    +-- logs/
-?? Configuration
-Environment Variables (recommended)
-Variable	Purpose
-SLSKD_API_KEY	API key for SLSKD
-SLSKD_HOST	Base URL for SLSKD (e.g., http://slskd:5030)
-SABNZBD_API_KEY	SABnzbd API key
-SABNZBD_HOST	SABnzbd base URL
-NAVIDROME_HOST	Navidrome base URL
-NAVIDROME_USER	Navidrome username
-NAVIDROME_PASSWORD	Navidrome password
-VOLUMIO_HOST	Volumio host/IP
-Your pipeline controller supports hard-coded values, but environment variables are strongly recommended for public deployments.
+ docker/
+    docker-compose.yml
+ config/
+    config.yaml          # beets configuration
+ scripts/
+    pipeline/            # pipeline subsystem modules
+       beets.py
+       cleanup.py
+       fuzzy.py
+       logging.py
+       metadata.py
+       moves.py
+       quarantine.py
+       regenerate.py
+       sabnzbd.py
+       settle.py
+       slskd.py
+       system_hooks.py
+       util.py
+    pipeline_controller_v7.py
+    beets_metadata_refresh.py
+    discogs_bulk_tag.py
+    fingerprint_all.py
+    cleanup_non_audio_files_v7.py
+ backend/                 # FastAPI application
+ public/                  # Web UI assets
+ static/
+ data/                    # Runtime data (gitignored)
+    library.db           # beets database
+    fingerprints.json    # AcoustID cache
+    *.log
+ entrypoint.sh
+```
 
-?? How the Pipeline Works
-1. Detect artist folders in /inbox
-Skips:
+---
 
-_UNPACK_ folders
+## Docker Volumes
 
-failed_imports
+| Container Path | Purpose |
+|----------------|---------|
+| `/inbox` | Incoming music from SLSKD/SABnzbd |
+| `/pre-library` | tmpfs staging area (RAM disk) |
+| `/music/library` | Final organized library |
+| `/music/quarantine` | Failed imports and corrupted files |
+| `/data` | beets DB, logs, pipeline state |
+| `/config` | beets config.yaml |
 
-Empty folders
+---
 
-2. Check SABnzbd + SLSKD
-If either is still processing ? skip.
+## Configuration
 
-3. Grace period
-Folder must be idle for a configurable number of seconds.
+Key settings in `docker-compose.yml`:
 
-4. Cleanup
-Removes junk files and empty directories.
+```yaml
+environment:
+  - BEETS_CONFIG=/config/config.yaml
+  - LIBRARY_PATH=/music/library
+  - INBOX_PATH=/inbox
 
-5. Album folder handling
-Moves album subfolders into /pre-library.
+tmpfs:
+  - /pre-library:size=8g    # Increase if large batches fill this up
+```
 
-6. Loose file grouping
-Groups by:
+Key settings in `pipeline_controller_v7.py`:
 
-albumartist
+```python
+CHUNK_SIZE = 500            # Albums per import chunk
+LOCK_FILE = "/data/pipeline.lock"
+```
 
-album
+---
 
-7. Chunking
-Large groups are processed in batches.
+## Requirements
 
-8. Fingerprinting
-Ensures accurate metadata matching.
+- Docker + Docker Compose
+- OpenMediaVault (or any Linux host with sufficient RAM)
+- 8GB+ RAM recommended for tmpfs pre-library
+- Chromaprint (`fpcalc`) for AcoustID fingerprinting
+- ffprobe for audio integrity checking
 
-9. Beets import
-Imports into /music/library.
+---
 
-10. Post-processing
-Updates metadata, moves files, refreshes library.
+## Changelog
 
-?? Running the Pipeline
-Inside the container:
+### v7.6
+- Added `clear_prelibrary()` — wipes pre-library at start of each run to prevent tmpfs accumulation from rejected/skipped files
 
-bash
-docker exec -it beetsV7 python3 /app/scripts/pipeline_controller_v7.py
-?? SLSKD API Example
-Test endpoint:
+### v7.5
+- Per-artist SLSKD transfer refresh (replaces stale startup snapshot)
+- Removed `global_settle()` hard gate; pipeline now processes non-active artists immediately
 
-bash
-curl -H "X-API-Key: <your-api-key>" \
-     http://<slskd-host>:5030/api/v0/application
-?? Testing the Pipeline
-Drop a folder into:
+### v7.4
+- Fuzzy token matching for SLSKD active transfer detection
+- Numeric token filtering prevents false positive folder matches
+- SABnzbd integration limited to genuinely active statuses only
+- Quarantine module uses `shutil.move` instead of copy+delete
 
-Code
-volumes/inbox/Artist Name/
-Watch logs:
+### v7.3
+- Incremental UI JSON regeneration (mtime-based cache, full rescan only on first run)
+- Background scheduler for 15-minute UI refresh
 
-bash
-docker logs -f beetsV7
-Or check:
-
-Code
-/data/pipeline.log
-/data/pipeline_verbose.log
-/data/pipeline_status.json
-?? Development Notes
-The pipeline is idempotent
-
-All destructive operations are safe
-
-Every step logs to both stdout and file
-
-The system is designed to survive container restarts
-
-All paths are absolute and volume-mounted
-
-?? Roadmap
-Global settle logic
-
-Async parallel ingestion
-
-REST API for pipeline control
-
-Web UI for pipeline status
-
-?? Credits
-Built for home-lab automation and deterministic media management.
-Designed for reproducibility, transparency, and maintainability.
+### Earlier
+- AcoustID fingerprint DB with mtime-based incremental scanning
+- Orphaned duplicate record cleanup in nightly metadata refresh
+- Discogs bulk tagger with primary artist consolidation
+- `albumartist_primary` custom field for path template organization
