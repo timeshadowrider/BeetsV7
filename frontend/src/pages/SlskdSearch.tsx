@@ -75,13 +75,6 @@ function normalizeStr(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").trim();
 }
 
-/**
- * Extract the first meaningful keyword from a title/album string,
- * skipping common filler words. Used to match against SLSKD file paths.
- * e.g. "Animal (Expanded Edition)" → "animal"
- *      "Electric Love"             → "electric"
- *      "The Middle"                → "middle"
- */
 function firstKeyWord(s: string): string {
   const stop = new Set(["the", "and", "feat", "with", "from", "live", "remix",
                         "version", "mix", "edit", "remaster", "deluxe", "bonus"]);
@@ -89,12 +82,6 @@ function firstKeyWord(s: string): string {
   return words[0] ?? "";
 }
 
-/**
- * Parse the /responses array from SLSKD.
- * Each response has: { username, files: [{filename, size, ...}] }
- * We match the first keyword of title (track mode) or album (album mode)
- * against the full file path (which includes folder names = artist/album).
- */
 function parseResponses(
   responses: any[],
   title: string,
@@ -113,7 +100,6 @@ function parseResponses(
       const fname = file.filename ?? "";
       const isAudio = /\.(flac|mp3|m4a|ogg|aac|wav)$/i.test(fname);
       if (!isAudio) continue;
-      // Normalise backslashes and check for keyword anywhere in full path
       const fullPath = normalizeStr(fname.replace(/\\/g, "/"));
       if (fullPath.includes(keyword)) {
         matches.push({
@@ -126,45 +112,103 @@ function parseResponses(
     }
   }
 
-  // Prefer FLAC → M4A → MP3, then largest file
   return matches.sort((a, b) =>
     a.quality !== b.quality ? b.quality - a.quality : b.size - a.size
   );
 }
 
-/**
- * Run a SLSKD search:
- * 1. POST /slskd/searches  → get search id
- * 2. Poll GET /slskd/searches/{id} until isComplete
- * 3. Fetch GET /slskd/searches/{id}/responses for actual file results
- */
-async function slskdSearch(query: string): Promise<any[]> {
-  // 1. Initiate
-  const { data: search } = await api.post("/ui/slskd/searches", {
-    searchText: query,
-    fileLimit: 500,
-    resultLimit: 50,
-  });
-  const id: string = search.id;
-
-  // 2. Poll state until complete — SLSKD searches take ~15-30s and end with
-  //    state "Completed" or "Completed, TimedOut". Poll for up to 40s.
-  for (let i = 0; i < 40; i++) {
-    await sleep(1000);
-    const { data: state } = await api.get(`/ui/slskd/searches/${id}`);
-    const done = state.isComplete ||
-                 (state.state ?? "").includes("Completed") ||
-                 (state.state ?? "").includes("TimedOut");
-    if (done) break;
-  }
-
-  // 3. Fetch actual file results — only populated after search completes
+// ── Connection ping via transfers endpoint (known to work) ────────────────────
+// Returns true if SLSKD API is reachable, false if not.
+async function pingSlskd(): Promise<boolean> {
   try {
-    const { data: responses } = await api.get(`/ui/slskd/searches/${id}/responses`);
-    return Array.isArray(responses) ? responses : [];
+    await api.get("/ui/slskd/transfers");
+    return true;
   } catch {
-    return [];
+    return false;
   }
+}
+
+// Waits until ping succeeds or maxWaitMs exceeded.
+async function waitForConnected(
+  maxWaitMs = 60_000,
+  log?: (msg: string, type?: string) => void,
+): Promise<boolean> {
+  const interval = 5_000;
+  const attempts = Math.ceil(maxWaitMs / interval);
+  for (let i = 0; i < attempts; i++) {
+    if (await pingSlskd()) return true;
+    log?.(`⏳ SLSKD not reachable, waiting ${interval / 1000}s… (${i + 1}/${attempts})`, "warn");
+    await sleep(interval);
+  }
+  return false;
+}
+
+// ── slskdSearch with connection guard + retry ─────────────────────────────────
+const SEARCH_DELAY_MS   = 8_000;  // between each track — Soulseek rate-limits aggressively
+const MAX_RETRIES       = 3;
+const RETRY_BACKOFF_MS  = 15_000; // wait 15s after a disconnect before retrying
+
+async function slskdSearch(
+  query: string,
+  log?: (msg: string, type?: string) => void,
+): Promise<any[]> {
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      log?.(`  ↩ Retry ${attempt}/${MAX_RETRIES - 1} for "${query}"`, "warn");
+      // Wait for reconnect before retrying
+      const connected = await waitForConnected(30_000, log);
+      if (!connected) {
+        log?.(`  ✗ SLSKD still not connected after waiting — skipping "${query}"`, "error");
+        return [];
+      }
+    }
+
+    try {
+      // 1. Initiate search
+      const { data: search } = await api.post("/ui/slskd/searches", {
+        searchText: query,
+        fileLimit: 500,
+        resultLimit: 50,
+      });
+      const id: string = search.id;
+
+      // 2. Poll until complete
+      for (let i = 0; i < 40; i++) {
+        await sleep(1_000);
+        const { data: state } = await api.get(`/ui/slskd/searches/${id}`);
+        const done = state.isComplete ||
+                     (state.state ?? "").includes("Completed") ||
+                     (state.state ?? "").includes("TimedOut");
+        if (done) break;
+      }
+
+      // 3. Fetch responses
+      try {
+        const { data: responses } = await api.get(`/ui/slskd/searches/${id}/responses`);
+        return Array.isArray(responses) ? responses : [];
+      } catch {
+        return [];
+      }
+
+    } catch (err: any) {
+      const msg: string = err?.message ?? String(err);
+      const isConnErr = /disconnect|connect|login/i.test(msg);
+
+      if (isConnErr) {
+        log?.(`  ⚠ Connection error on "${query}": ${msg}`, "warn");
+        if (attempt < MAX_RETRIES - 1) {
+          await sleep(RETRY_BACKOFF_MS);
+          continue;
+        }
+      } else {
+        // Non-connection error — don't retry
+        log?.(`  ✗ Search error: ${msg}`, "error");
+        return [];
+      }
+    }
+  }
+
+  return [];
 }
 
 async function countActiveTransfers(): Promise<number> {
@@ -197,9 +241,12 @@ export default function SlskdSearch() {
   const [logs,        setLogs]        = useState<{ msg: string; type: string }[]>([]);
   const [progress,    setProgress]    = useState(0);
   const [slskdActive, setSlskdActive] = useState<number | null>(null);
+  const [eta,         setEta]         = useState<string>("");
 
-  const logRef   = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const logRef      = useRef<HTMLDivElement>(null);
+  const inputRef    = useRef<HTMLInputElement>(null);
+  const abortRef    = useRef(false);
+  const startTimeRef = useRef<number>(0);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -208,7 +255,7 @@ export default function SlskdSearch() {
   useEffect(() => {
     const poll = async () => setSlskdActive(await countActiveTransfers());
     poll();
-    const id = setInterval(poll, 15000);
+    const id = setInterval(poll, 15_000);
     return () => clearInterval(id);
   }, []);
 
@@ -229,6 +276,7 @@ export default function SlskdSearch() {
       setResults([]);
       setLogs([]);
       setProgress(0);
+      setEta("");
       addLog(`Loaded ${rows.length} tracks from ${file.name}`);
     };
     reader.readAsText(file, "utf-8");
@@ -250,10 +298,21 @@ export default function SlskdSearch() {
     const cols = detectColumns(csvRows);
     if (!cols.title) { addLog("Cannot detect Track Name column", "error"); return; }
 
+    // Wait for SLSKD to be connected before starting
+    addLog("Checking SLSKD connection…");
+    const connected = await waitForConnected(30_000, addLog);
+    if (!connected) {
+      addLog("✗ SLSKD is not connected. Please reconnect and try again.", "error");
+      return;
+    }
+
     setSearching(true);
+    abortRef.current = false;
     setFilter("all");
     setLogs([]);
     setProgress(0);
+    setEta("");
+    startTimeRef.current = Date.now();
 
     const initial: TrackResult[] = csvRows.map((r, i) => ({
       idx:     i,
@@ -264,15 +323,17 @@ export default function SlskdSearch() {
       matches: [],
     }));
     setResults(initial);
-    addLog(`Starting ${mode} search for ${initial.length} tracks...`);
+    addLog(`Starting ${mode} search for ${initial.length} tracks…`);
+    addLog(`⏱ Pacing: ~${SEARCH_DELAY_MS / 1000}s between searches to avoid disconnects`);
 
     for (let i = 0; i < initial.length; i++) {
+      if (abortRef.current) {
+        addLog("Search cancelled.", "warn");
+        break;
+      }
+
       const track = { ...initial[i] };
-
-      // Primary artist — split "Luis Fonsi;Daddy Yankee" → "Luis Fonsi"
       const primaryArtist = track.artist.split(";")[0].trim();
-
-      // Album: first 3 meaningful words (avoids long noisy queries)
       const albumShort = track.album
         .replace(/[^a-zA-Z0-9\s]/g, " ")
         .trim()
@@ -285,10 +346,20 @@ export default function SlskdSearch() {
         ? `${primaryArtist} ${albumShort}`.trim()
         : `${primaryArtist} ${track.title}`.trim();
 
-      addLog(`Searching: "${query}"`);
+      addLog(`[${i + 1}/${initial.length}] Searching: "${query}"`);
+
+      // Update ETA
+      if (i > 0) {
+        const elapsed = (Date.now() - startTimeRef.current) / 1000;
+        const avgPerTrack = elapsed / i;
+        const remaining = Math.round(avgPerTrack * (initial.length - i));
+        const mins = Math.floor(remaining / 60);
+        const secs = remaining % 60;
+        setEta(mins > 0 ? `~${mins}m ${secs}s left` : `~${secs}s left`);
+      }
 
       try {
-        const responses = await slskdSearch(query);
+        const responses = await slskdSearch(query, addLog);
         const matches   = parseResponses(responses, track.title, mode, track.album);
         track.status    = matches.length ? "found" : "missing";
         track.matches   = matches;
@@ -305,11 +376,26 @@ export default function SlskdSearch() {
 
       setProgress(Math.round(((i + 1) / initial.length) * 100));
       setResults(prev => prev.map((r, idx) => idx === i ? track : r));
-      await sleep(300);
+
+      // Pace between searches — only if not the last track
+      if (i < initial.length - 1 && !abortRef.current) {
+        await sleep(SEARCH_DELAY_MS);
+      }
     }
 
     setSearching(false);
-    addLog("Search complete.", "info");
+    setEta("");
+    const finalResults = await new Promise<TrackResult[]>(res =>
+      setResults(prev => { res(prev); return prev; })
+    );
+    const found   = finalResults.filter(r => r.status === "found").length;
+    const missing = finalResults.filter(r => r.status === "missing").length;
+    addLog(`Search complete. Found: ${found} | Missing: ${missing}`, "info");
+  }
+
+  function stopSearch() {
+    abortRef.current = true;
+    addLog("Stopping after current track…", "warn");
   }
 
   async function queueDownload(idx: number) {
@@ -334,9 +420,19 @@ export default function SlskdSearch() {
     }
   }
 
+  async function queueAll() {
+    const found = results.filter(r => r.status === "found");
+    addLog(`Queueing all ${found.length} found tracks…`, "queue");
+    for (const track of found) {
+      await queueDownload(track.idx);
+      await sleep(300);
+    }
+    addLog(`Done queuing.`, "queue");
+  }
+
   function clearAll() {
     setCsvRows([]); setResults([]); setFileName("");
-    setLogs([]); setProgress(0); setFilter("all");
+    setLogs([]); setProgress(0); setFilter("all"); setEta("");
     if (inputRef.current) inputRef.current.value = "";
   }
 
@@ -365,6 +461,7 @@ export default function SlskdSearch() {
     if (type === "miss")  return "text-yellow-400";
     if (type === "error") return "text-red-400";
     if (type === "queue") return "text-accent";
+    if (type === "warn")  return "text-orange-400";
     return "text-gray-400";
   }
 
@@ -421,14 +518,24 @@ export default function SlskdSearch() {
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <button
-            onClick={runSearch}
-            disabled={!csvRows.length || searching}
-            className="px-5 py-2 bg-accent text-black font-semibold text-sm rounded-lg
-                       hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed transition"
-          >
-            {searching ? "Searching..." : "Search SLSKD"}
-          </button>
+          {!searching ? (
+            <button
+              onClick={runSearch}
+              disabled={!csvRows.length}
+              className="px-5 py-2 bg-accent text-black font-semibold text-sm rounded-lg
+                         hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed transition"
+            >
+              Search SLSKD
+            </button>
+          ) : (
+            <button
+              onClick={stopSearch}
+              className="px-5 py-2 bg-red-600 text-white font-semibold text-sm rounded-lg
+                         hover:bg-red-500 transition"
+            >
+              Stop
+            </button>
+          )}
 
           <button
             onClick={clearAll}
@@ -439,11 +546,26 @@ export default function SlskdSearch() {
             Clear
           </button>
 
+          {stats.found > 0 && !searching && (
+            <button
+              onClick={queueAll}
+              className="px-4 py-2 bg-zinc-700 text-accent text-sm rounded-lg
+                         hover:bg-zinc-600 transition font-mono"
+            >
+              ⬇ Queue All Found ({stats.found})
+            </button>
+          )}
+
+          {searching && eta && (
+            <span className="text-xs text-gray-500 font-mono">{eta}</span>
+          )}
+
           <div className="ml-auto flex items-center gap-2">
             <span className="text-xs text-gray-500">Search by:</span>
             <div className="flex border border-zinc-700 rounded-lg overflow-hidden">
               {(["tracks", "albums"] as SearchMode[]).map(m => (
                 <button key={m} onClick={() => setMode(m)}
+                  disabled={searching}
                   className={`px-3 py-1 text-xs capitalize transition ${
                     mode === m
                       ? "bg-accent text-black font-semibold"
@@ -458,7 +580,7 @@ export default function SlskdSearch() {
         </div>
       </div>
 
-      {searching && (
+      {(searching || progress > 0) && (
         <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
           <div className="h-full bg-accent transition-all duration-300" style={{ width: `${progress}%` }} />
         </div>
@@ -543,7 +665,7 @@ export default function SlskdSearch() {
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs text-gray-500 font-mono uppercase tracking-wide">Search Log</span>
             <div className="flex items-center gap-3">
-              {searching && <span className="text-xs text-accent animate-pulse">Running...</span>}
+              {searching && <span className="text-xs text-accent animate-pulse">Running…</span>}
               <button onClick={() => setLogs([])}
                 className="text-xs text-gray-600 hover:text-gray-400 transition">Clear</button>
             </div>
