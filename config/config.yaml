@@ -7,6 +7,8 @@
 directory: /music/library
 library: /data/library.db
 
+logfile: /data/beets.log
+
 ui:
   color: yes
 
@@ -66,13 +68,6 @@ tiebreak:
   format: [FLAC, ALAC, AAC, MP3]
   bitdepth: desc
   samplerate: desc
-
-logging:
-  level: INFO
-  handlers:
-    file:
-      filename: /data/beets.log
-      format: '%(asctime)s [%(levelname)s] %(message)s'
 
 # ----------------------------------------------------------------------------
 # PLUGINS

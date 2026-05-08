@@ -1,8 +1,8 @@
 {
-  "artists": 576,
-  "albums": 1941,
-  "tracks": 22317,
-  "total_duration": 5380724.908086006,
-  "total_duration_human": "1494:38:44",
-  "total_size": 768927044302
+  "artists": 0,
+  "albums": 0,
+  "tracks": 0,
+  "total_duration": 0,
+  "total_duration_human": "00:00",
+  "total_size": 0
 }

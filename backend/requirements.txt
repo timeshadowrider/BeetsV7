@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-beets
+beets>=1.6.0
 python-magic
 jq
 watchdog
