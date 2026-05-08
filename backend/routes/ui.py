@@ -43,8 +43,7 @@ router = APIRouter(tags=["ui"])
 # ---------------------------------------------------------
 # Run pipeline (UI-triggered)
 # ---------------------------------------------------------
-def _run_pipeline():
-    subprocess.run(["python3", "/app/scripts/pipeline_controller_v7.py"], check=False)
+from backend.routes.pipeline_v7 import _run_pipeline
 
 
 @router.post("/pipeline/run")
@@ -246,13 +245,12 @@ def _primary_artist(artist: str) -> str:
 
 def _beet_query(title: str, artist: str = "") -> str | None:
     norm_title = _normalize(title)
+    cmd = ["beet", "ls", "-p", f"title:{norm_title}"]
     if artist:
         norm_artist = _normalize(artist)
-        cmd = f'beet ls -p title:"{norm_title}" artist:"{norm_artist}"'
-    else:
-        cmd = f'beet ls -p title:"{norm_title}"'
+        cmd.append(f"artist:{norm_artist}")
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
         return lines[0] if lines else None
     except Exception as e:

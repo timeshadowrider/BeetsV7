@@ -8,7 +8,7 @@ import requests
 from .util import LIBRARY
 from .logging import log
 
-SUBSONIC_HOST     = os.getenv("SUBSONIC_HOST",     "http://10.0.0.100")
+SUBSONIC_HOST     = os.getenv("SUBSONIC_HOST",     "http://10.0.0.102")
 SUBSONIC_PORT     = os.getenv("SUBSONIC_PORT",     "4533")
 SUBSONIC_USER     = os.getenv("SUBSONIC_USER",     "")
 SUBSONIC_PASSWORD = os.getenv("SUBSONIC_PASSWORD", "")

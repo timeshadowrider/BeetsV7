@@ -5,6 +5,7 @@ import VolumioBuilder from "./pages/VolumioBuilder";
 import Logs from "./pages/Logs";
 import PipelineControl from "./pages/PipelineControl";
 import SlskdSearch from "./pages/SlskdSearch";
+import NavidromeBuilder from "./pages/NavidromeBuilder";
 
 export const routes: RouteObject[] = [
   { path: "/", element: <Dashboard /> },
@@ -12,5 +13,6 @@ export const routes: RouteObject[] = [
   { path: "/volumio", element: <VolumioBuilder /> },
   { path: "/slskd", element: <SlskdSearch /> },
   { path: "/logs", element: <Logs /> },
-  { path: "/pipeline", element: <PipelineControl /> }
+  { path: "/pipeline", element: <PipelineControl /> },
+  { path: "/navidrome", element: <NavidromeBuilder /> }
 ];

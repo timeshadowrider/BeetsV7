@@ -86,6 +86,7 @@ data/discogs_bulk_tag.log
 data/albums.json
 data/recent_albums.json
 data/stats.json
+data/state.pickle
 data/beets-library.blb
 data/playlist/
 

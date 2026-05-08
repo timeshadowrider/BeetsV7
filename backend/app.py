@@ -22,7 +22,7 @@ import threading
 from pathlib import Path
 
 # Import routers
-from backend.routes import pipeline_v7, ui
+from backend.routes import pipeline_v7, ui, navidrome_routes
 from backend.services.watcher_service import start_inbox_settle_watcher
 from backend.services.pipeline_scheduler import get_scheduler
 from backend.services.metadata_refresh_scheduler import get_metadata_scheduler
@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     Starts all watchers and schedulers on startup, stops them on shutdown.
     """
     # STARTUP
-    logger.info("🚀 Starting BeetsV7 Backend v7.5...")
+    logger.info("?? Starting BeetsV7 Backend v7.5...")
 
     # 1. Start inbox settle watcher
     logger.info("[STARTUP] Starting inbox settle watcher...")
@@ -85,9 +85,9 @@ async def lifespan(app: FastAPI):
     pipeline_scheduler.start()
 
     if mode == "continuous":
-        logger.info("🔄 Pipeline in CONTINUOUS mode - runs immediately after completion")
+        logger.info("?? Pipeline in CONTINUOUS mode - runs immediately after completion")
     else:
-        logger.info(f"⏱️  Pipeline in INTERVAL mode - runs every {interval_minutes} minutes")
+        logger.info(f"??  Pipeline in INTERVAL mode - runs every {interval_minutes} minutes")
 
     # 4. Start metadata refresh scheduler
     metadata_mode = os.getenv("METADATA_REFRESH_MODE", "daily")
@@ -119,17 +119,17 @@ async def lifespan(app: FastAPI):
     regen_scheduler.start()
     logger.info(f"[STARTUP] Regenerate scheduler started (every {regen_interval} min, runs immediately on boot)")
 
-    logger.info("✅ All watchers and schedulers started successfully")
+    logger.info("? All watchers and schedulers started successfully")
 
     yield  # Application is now running
 
     # SHUTDOWN
-    logger.info("🛑 Shutting down BeetsV7 Backend...")
+    logger.info("?? Shutting down BeetsV7 Backend...")
     pipeline_scheduler.stop()
     metadata_scheduler.stop()
     discogs_scheduler.stop()
     regen_scheduler.stop()
-    logger.info("✅ Shutdown complete")
+    logger.info("? Shutdown complete")
 
 # ---------------------------------------------------------
 # Create FastAPI app with lifespan
@@ -162,6 +162,7 @@ os.makedirs("/app/public", exist_ok=True)
 # ---------------------------------------------------------
 app.include_router(pipeline_v7.router, prefix="/api")
 app.include_router(ui.router, prefix="/api/ui")
+app.include_router(navidrome_routes.router, prefix="/api/ui/navidrome")
 
 # ---------------------------------------------------------
 # Health check endpoints
