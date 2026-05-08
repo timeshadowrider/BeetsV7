@@ -81,3 +81,14 @@ data/fingerprints.json
 data/last_beets_imports.log
 data/metadata_refresh.log
 data/discogs_bulk_tag.log
+
+# Generated data files (rebuilt at runtime)
+data/albums.json
+data/recent_albums.json
+data/stats.json
+data/state.pickle
+data/beets-library.blb
+data/playlist/
+
+# Compiled frontend assets
+public/assets/
