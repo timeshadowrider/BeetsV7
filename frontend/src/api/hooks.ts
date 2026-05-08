@@ -43,7 +43,10 @@ export function useAllAlbums() {
     queryFn: async () => {
       const { data } = await api.get("/ui/albums/all");
       return data as any[];
-    }
+    },
+    refetchInterval: 120_000,
+    staleTime: 60_000,
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -73,16 +76,6 @@ export function useBeetsLog() {
   });
 }
 
-export function usePipelineStatus() {
-  return useQuery({
-    queryKey: ["pipeline", "status"],
-    queryFn: async () => {
-      const { data } = await api.get("/status");
-      return data;
-    },
-    enabled: false
-  });
-}
 
 export async function runPipeline() {
   await api.post("/pipeline/run");

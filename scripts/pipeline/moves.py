@@ -10,12 +10,31 @@ Changes from v7.6:
 """
 
 import errno
+import os
 import shutil
 import time
 from pathlib import Path
 
 from .logging import vlog, log
 from .util import PRELIB, INBOX, safe_folder_name
+
+
+def _check_dest_space(src: Path, dest_dir: Path):
+    """Raise PreLibraryFullError if dest_dir lacks space for src."""
+    try:
+        src_size = src.stat().st_size if src.is_file() else sum(
+            f.stat().st_size for f in src.rglob("*") if f.is_file()
+        )
+        st = os.statvfs(dest_dir)
+        free = st.f_bavail * st.f_frsize
+        if src_size > free:
+            raise PreLibraryFullError(
+                "Not enough space on destination: need %d bytes, %d free" % (src_size, free)
+            )
+    except PreLibraryFullError:
+        raise
+    except Exception:
+        pass  # statvfs failure is non-fatal — let the move attempt proceed
 
 
 class PreLibraryFullError(Exception):
@@ -35,6 +54,8 @@ def move_group_to_prelibrary(albumartist, album, files):
     dst_folder = ensure_album_folder(albumartist, album)
 
     for src in files:
+        if src.exists():
+            _check_dest_space(src, dst_folder)
         if not src.exists():
             vlog("[MOVE] File disappeared: %s" % src)
             continue
@@ -87,6 +108,8 @@ def move_existing_album_folder_to_prelibrary(src_album_folder: Path):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         dst = PRELIB / (str(rel) + "_" + timestamp)
         vlog("[ALBUM-MOVE] Destination exists, using: %s" % dst)
+
+    _check_dest_space(src_album_folder, dst.parent)
 
     try:
         shutil.move(str(src_album_folder), str(dst))

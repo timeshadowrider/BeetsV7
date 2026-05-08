@@ -5,7 +5,7 @@ export default function PipelineControl() {
   const [status, setStatus] = useState<string>("");
 
   const onRun = async () => {
-    setStatus("Starting pipeline…");
+    setStatus("Starting pipeline...");
     try {
       await runPipeline();
       setStatus("Pipeline started.");

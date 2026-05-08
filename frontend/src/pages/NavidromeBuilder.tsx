@@ -46,7 +46,7 @@ export default function NavidromeBuilder() {
         } catch {
           return; // swallow harmless empty responses        
         }
-      }, 1000);
+      }, 2500);
     } else {
       if (pollRef.current) {
         clearInterval(pollRef.current);

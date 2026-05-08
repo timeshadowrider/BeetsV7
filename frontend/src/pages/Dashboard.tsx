@@ -37,9 +37,9 @@ export default function Dashboard() {
             !lib
               ? []
               : [
-                  { label: "Artists", value: lib.artists ?? "—" },
-                  { label: "Albums",  value: lib.albums  ?? "—" },
-                  { label: "Tracks",  value: lib.tracks  ?? "—" },
+                  { label: "Artists", value: lib.artists ?? "â€”" },
+                  { label: "Albums",  value: lib.albums  ?? "â€”" },
+                  { label: "Tracks",  value: lib.tracks  ?? "â€”" },
                   ...(lib.formats != null
                     ? [{ label: "Formats", value: lib.formats }]
                     : []),
@@ -60,8 +60,8 @@ export default function Dashboard() {
             !inbox
               ? []
               : [
-                  { label: "Artists", value: inbox.artists ?? "—" },
-                  { label: "Tracks",  value: inbox.tracks  ?? "—" }
+                  { label: "Artists", value: inbox.artists ?? "â€”" },
+                  { label: "Tracks",  value: inbox.tracks  ?? "â€”" }
                 ]
           }
         />

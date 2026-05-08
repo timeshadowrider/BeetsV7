@@ -23,7 +23,7 @@ Three-tier approach:
     If both tracks resolve to the same recording, confirms the duplicate.
     Controlled by DEDUP_USE_MUSICBRAINZ env var (default: true).
 
-Rejected files are moved to /tmp/pipeline-work/dedup_rejected/ for review.
+Rejected files are moved to /data/quarantine/dedup_rejected/ for review.
 A dedup log is written to /data/dedup.log.
 
 Quality scoring (higher = better):
@@ -61,9 +61,9 @@ except ImportError:
     MB_AVAILABLE = False
 
 # Config
-DEDUP_REJECTED_DIR = Path("/tmp/pipeline-work/dedup_rejected")
+DEDUP_REJECTED_DIR = Path("/data/quarantine/dedup_rejected")
 DEDUP_LOG = Path("/data/dedup.log")
-ACOUSTID_API_KEY = "ToQiZOt39C"  # matches config.yaml
+ACOUSTID_API_KEY = os.getenv("ACOUSTID_API_KEY", os.getenv("ACOUSTID_APIKEY", ""))
 
 # Fingerprint similarity threshold (0.0-1.0)
 # 0.85 = same recording, allows for minor encoding differences
@@ -437,7 +437,7 @@ def _mb_confirm(candidates: list[Path], fp_map: dict) -> list[Path]:
     else:
         # Different recordings - false positive, keep all
         dlog("TIER3: false positive - files are different recordings %s, keeping all" % unique_ids)
-        return candidates[:1]  # Return only first to trigger keep-all path
+        return candidates
 
 
 # ---------------------------------------------------------------------------

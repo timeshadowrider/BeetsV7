@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 import logging
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ class MetadataRefreshScheduler:
         
         # If target time has passed today, schedule for tomorrow
         if target <= now:
-            target = target.replace(day=target.day + 1)
+            target = target + timedelta(days=1)
         
         delta = target - now
         return int(delta.total_seconds())

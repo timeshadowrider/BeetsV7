@@ -26,10 +26,10 @@ import io
 import logging
 import os
 import re as _re
-import subprocess
-import unicodedata
 from pathlib import Path
 from typing import Optional
+
+from backend.utils.beet_search import search_beets_for_track as _beet_search_impl
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -83,94 +83,15 @@ def clear_navidrome_log():
 
 
 # ---------------------------------------------------------------------------
-# Matching helpers — identical logic to the Volumio builder
+# Matching helpers — delegate to shared beet_search utility
 # ---------------------------------------------------------------------------
 
-def _normalize(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = _re.sub(r"[^a-z0-9 ]", "", s.lower())
-    return s.strip()
-
-
-def _primary_artist(artist: str) -> str:
-    return artist.replace(";", ",").split(",")[0].strip()
-
-
-def _beet_query(title: str, artist: str = "") -> str | None:
-    norm_title = _normalize(title)
-    if artist:
-        norm_artist = _normalize(artist)
-        cmd = f'beet ls -p title:"{norm_title}" artist:"{norm_artist}"'
-    else:
-        cmd = f'beet ls -p title:"{norm_title}"'
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=10
-        )
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        return lines[0] if lines else None
-    except Exception as e:
-        navidrome_logger.error(f"[NAVIDROME] beet query error ({cmd!r}): {e}")
-        return None
-
-
-def _artist_matches(beets_path: str, expected_artist: str) -> bool:
-    if not expected_artist:
-        return True
-    relative = beets_path.replace(_BEETS_LIBRARY_PREFIX, "")
-    parts = relative.split("/")
-    path_artist = parts[0] if parts else ""
-    norm_path = _normalize(path_artist)
-    if not norm_path:
-        navidrome_logger.warning(
-            f"[NAVIDROME] Could not extract artist from path: {beets_path}"
-        )
-        return False
-    all_artists = [
-        a.strip()
-        for a in expected_artist.replace(";", ",").split(",")
-        if a.strip()
-    ]
-    for candidate in all_artists:
-        norm_candidate = _normalize(candidate)
-        if norm_candidate in norm_path or norm_path in norm_candidate:
-            navidrome_logger.info(
-                f"[NAVIDROME] Artist verified: path='{path_artist}' matches '{candidate}'"
-            )
-            return True
-    navidrome_logger.warning(
-        f"[NAVIDROME] Artist mismatch: path='{path_artist}' not in {all_artists}"
-    )
-    return False
-
-
 def _search_beets_for_track(title: str, artist: str) -> str | None:
-    navidrome_logger.info(f"[NAVIDROME] Searching: '{artist} - {title}'")
-
-    path = _beet_query(title, artist)
-    if path:
-        navidrome_logger.info(f"[NAVIDROME] MATCH pass1 (full artist): {path}")
-        return path
-
-    primary = _primary_artist(artist)
-    if primary != artist and primary:
-        path = _beet_query(title, primary)
-        if path:
-            navidrome_logger.info(f"[NAVIDROME] MATCH pass2 (primary artist): {path}")
-            return path
-
-    path = _beet_query(title)
-    if path:
-        if _artist_matches(path, artist):
-            navidrome_logger.info(
-                f"[NAVIDROME] MATCH pass3 (title+artist verified): {path}"
-            )
-            return path
-        else:
-            navidrome_logger.warning(f"[NAVIDROME] REJECTED pass3 (wrong artist): {path}")
-
-    navidrome_logger.warning(f"[NAVIDROME] NO MATCH: '{artist} - {title}'")
-    return None
+    return _beet_search_impl(
+        title, artist,
+        library_prefix=_BEETS_LIBRARY_PREFIX,
+        logger=navidrome_logger,
+    )
 
 
 # ---------------------------------------------------------------------------

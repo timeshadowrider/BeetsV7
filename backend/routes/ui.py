@@ -2,7 +2,6 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Request
 from fastapi.responses import PlainTextResponse, FileResponse
 from pathlib import Path
-import subprocess
 import threading
 import logging
 import asyncio
@@ -10,8 +9,9 @@ import json
 import os
 import io
 import csv
-import unicodedata
 from urllib.parse import unquote
+
+from backend.utils.beet_search import search_beets_for_track as _beet_search_impl
 
 DATA_DIR = Path("/data")
 MUSIC_DIR = Path("/music/library")
@@ -189,7 +189,9 @@ def get_all_albums():
 def get_cover(artist: str, album: str):
     artist = unquote(artist)
     album = unquote(album)
-    cover_path = MUSIC_DIR / artist / album / "cover.jpg"
+    cover_path = (MUSIC_DIR / artist / album / "cover.jpg").resolve()
+    if not str(cover_path).startswith(str(MUSIC_DIR.resolve())):
+        raise HTTPException(403, "Invalid path")
     if not cover_path.exists():
         raise HTTPException(404, "Cover not found")
     return FileResponse(str(cover_path), media_type="image/jpeg")
@@ -198,25 +200,32 @@ def get_cover(artist: str, album: str):
 # ---------------------------------------------------------
 # Logs
 # ---------------------------------------------------------
+def _tail(path: Path, lines: int = 500) -> str:
+    """Return the last N lines of a file without reading the whole thing."""
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    parts = text.splitlines()
+    return "\n".join(parts[-lines:])
+
+
 @router.get("/logs/pipeline", response_class=PlainTextResponse)
-def get_pipeline_log():
+def get_pipeline_log(lines: int = 500):
     if not LOG_PIPELINE.exists():
         raise HTTPException(404, "pipeline log not found")
-    return LOG_PIPELINE.read_text(encoding="utf-8")
+    return _tail(LOG_PIPELINE, lines)
 
 
 @router.get("/logs/beets", response_class=PlainTextResponse)
-def get_beets_log():
+def get_beets_log(lines: int = 500):
     if not LOG_BEETS.exists():
         raise HTTPException(404, "beets log not found")
-    return LOG_BEETS.read_text(encoding="utf-8")
+    return _tail(LOG_BEETS, lines)
 
 
 @router.get("/logs/volumio", response_class=PlainTextResponse)
-def get_volumio_log():
-    if not LOG_VOLUMIO.exists():
-        return ""
-    return LOG_VOLUMIO.read_text(encoding="utf-8")
+def get_volumio_log(lines: int = 500):
+    return _tail(LOG_VOLUMIO, lines)
 
 
 @router.delete("/logs/volumio")
@@ -230,82 +239,8 @@ def clear_volumio_log():
 # Volumio Playlist Builder (Spotify CSV -> Volumio WebSocket)
 # =============================================================
 
-import re as _re
-
-
-def _normalize(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = _re.sub(r"[^a-z0-9 ]", "", s.lower())
-    return s.strip()
-
-
-def _primary_artist(artist: str) -> str:
-    return artist.replace(";", ",").split(",")[0].strip()
-
-
-def _beet_query(title: str, artist: str = "") -> str | None:
-    norm_title = _normalize(title)
-    cmd = ["beet", "ls", "-p", f"title:{norm_title}"]
-    if artist:
-        norm_artist = _normalize(artist)
-        cmd.append(f"artist:{norm_artist}")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        return lines[0] if lines else None
-    except Exception as e:
-        volumio_logger.error(f"[VOLUMIO] beet query error ({cmd!r}): {e}")
-        return None
-
-
-def _artist_matches(beets_path: str, expected_artist: str) -> bool:
-    if not expected_artist:
-        return True
-    parts = beets_path.replace("/music/library/", "").split("/")
-    path_artist = parts[0] if parts else ""
-    norm_path = _normalize(path_artist)
-    if not norm_path:
-        volumio_logger.warning(f"[VOLUMIO] Could not extract artist from path: {beets_path}")
-        return False
-    all_artists = [a.strip() for a in expected_artist.replace(";", ",").split(",") if a.strip()]
-    for candidate in all_artists:
-        norm_candidate = _normalize(candidate)
-        if norm_candidate in norm_path or norm_path in norm_candidate:
-            volumio_logger.info(
-                f"[VOLUMIO] Artist verified: path='{path_artist}' matches candidate='{candidate}'"
-            )
-            return True
-    volumio_logger.warning(
-        f"[VOLUMIO] Artist mismatch: path='{path_artist}' not in {all_artists} for {beets_path}"
-    )
-    return False
-
-
 def _search_beets_for_track(title: str, artist: str) -> str | None:
-    volumio_logger.info(f"[VOLUMIO] Searching: '{artist} - {title}'")
-
-    path = _beet_query(title, artist)
-    if path:
-        volumio_logger.info(f"[VOLUMIO] MATCH pass1 (full artist): {path}")
-        return path
-
-    primary = _primary_artist(artist)
-    if primary != artist and primary:
-        path = _beet_query(title, primary)
-        if path:
-            volumio_logger.info(f"[VOLUMIO] MATCH pass2 (primary artist): {path}")
-            return path
-
-    path = _beet_query(title)
-    if path:
-        if _artist_matches(path, artist):
-            volumio_logger.info(f"[VOLUMIO] MATCH pass3 (title+artist verified): {path}")
-            return path
-        else:
-            volumio_logger.warning(f"[VOLUMIO] REJECTED pass3 (wrong artist): {path}")
-
-    volumio_logger.warning(f"[VOLUMIO] NO MATCH: '{artist} - {title}'")
-    return None
+    return _beet_search_impl(title, artist, logger=volumio_logger)
 
 
 def _path_to_volumio_uri(abs_path: str) -> str:
@@ -444,96 +379,86 @@ async def build_volumio_playlist(file: UploadFile = File(...)):
 
 
 @router.get("/volumio/playlists")
-def list_volumio_playlists():
-    import httpx
+async def list_volumio_playlists():
     try:
-        resp = httpx.get(f"{VOLUMIO_HOST}/api/v1/listplaylists", timeout=5.0)
-        return {"playlists": resp.json()}
+        r = await _slskd_client.get(f"{VOLUMIO_HOST}/api/v1/listplaylists")
+        return {"playlists": r.json()}
     except Exception as e:
         raise HTTPException(502, f"Cannot reach Volumio: {e}")
 
 
 # =============================================================
 # SLSKD Proxy Routes
+# Module-level AsyncClient is reused across requests (connection pooling).
 # =============================================================
+
+import httpx as _httpx
+
+_slskd_client = _httpx.AsyncClient(timeout=15.0)
+
 
 @router.post("/slskd/searches")
 async def slskd_search_proxy(payload: dict):
-    import httpx
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                f"{SLSKD_HOST}/api/v0/searches",
-                headers=SLSKD_HEADERS,
-                json=payload,
-                timeout=15.0,
-            )
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPError as e:
+        r = await _slskd_client.post(
+            f"{SLSKD_HOST}/api/v0/searches",
+            headers=SLSKD_HEADERS,
+            json=payload,
+        )
+        r.raise_for_status()
+        return r.json()
+    except _httpx.HTTPError as e:
         raise HTTPException(502, f"SLSKD error: {e}")
 
 
 @router.get("/slskd/searches/{search_id}")
 async def slskd_poll_proxy(search_id: str):
-    import httpx
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{SLSKD_HOST}/api/v0/searches/{search_id}",
-                headers=SLSKD_HEADERS,
-                timeout=15.0,
-            )
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPError as e:
+        r = await _slskd_client.get(
+            f"{SLSKD_HOST}/api/v0/searches/{search_id}",
+            headers=SLSKD_HEADERS,
+        )
+        r.raise_for_status()
+        return r.json()
+    except _httpx.HTTPError as e:
         raise HTTPException(502, f"SLSKD error: {e}")
 
 
 @router.get("/slskd/searches/{search_id}/responses")
 async def slskd_responses_proxy(search_id: str):
-    import httpx
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{SLSKD_HOST}/api/v0/searches/{search_id}/responses",
-                headers=SLSKD_HEADERS,
-                timeout=15.0,
-            )
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPError as e:
+        r = await _slskd_client.get(
+            f"{SLSKD_HOST}/api/v0/searches/{search_id}/responses",
+            headers=SLSKD_HEADERS,
+        )
+        r.raise_for_status()
+        return r.json()
+    except _httpx.HTTPError as e:
         raise HTTPException(502, f"SLSKD error: {e}")
 
 
 @router.post("/slskd/downloads/{username}")
 async def slskd_download_proxy(username: str, request: Request):
-    import httpx
     try:
         raw_body = await request.body()
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                f"{SLSKD_HOST}/api/v0/transfers/downloads/{username}",
-                headers={**SLSKD_HEADERS, "Content-Type": "application/json"},
-                content=raw_body,
-                timeout=15.0,
-            )
-            return {"status": r.status_code, "ok": r.is_success}
-    except httpx.HTTPError as e:
+        r = await _slskd_client.post(
+            f"{SLSKD_HOST}/api/v0/transfers/downloads/{username}",
+            headers={**SLSKD_HEADERS, "Content-Type": "application/json"},
+            content=raw_body,
+        )
+        return {"status": r.status_code, "ok": r.is_success, "detail": r.text[:200] if not r.is_success else None}
+    except _httpx.HTTPError as e:
         raise HTTPException(502, f"SLSKD error: {e}")
 
 
 @router.get("/slskd/transfers")
 async def slskd_transfers_proxy():
-    import httpx
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{SLSKD_HOST}/api/v0/transfers/downloads",
-                headers=SLSKD_HEADERS,
-                timeout=15.0,
-            )
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPError as e:
+        r = await _slskd_client.get(
+            f"{SLSKD_HOST}/api/v0/transfers/downloads",
+            headers=SLSKD_HEADERS,
+        )
+        r.raise_for_status()
+        return r.json()
+    except _httpx.HTTPError as e:
         raise HTTPException(502, f"SLSKD error: {e}")

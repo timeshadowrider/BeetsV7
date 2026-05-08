@@ -43,7 +43,7 @@ export default function VolumioBuilder() {
         } catch {
           // endpoint may not exist yet
         }
-      }, 1000);
+      }, 2500);
     } else {
       if (pollRef.current) {
         clearInterval(pollRef.current);
