@@ -1,31 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v7.7 HYBRID Pipeline Controller
+v7.9 HYBRID Pipeline Controller
 
-Changes from v7.6:
-- drain_prelibrary(): new helper that runs fingerprint+import+post-process
-  on whatever is currently in pre-library, then clears it. Used at startup
-  (replacing the plain clear) and mid-run when the tmpfs is getting full.
-
-- prelibrary_usage_pct(): reads the tmpfs usage via os.statvfs and returns
-  0-100. Called before each album/group move in the processing loops.
-
-- Proactive tmpfs monitoring: before moving each album folder or loose file
-  group to pre-library, if usage >= PRELIB_DRAIN_THRESHOLD (default 85%)
-  the controller drains pre-library first rather than waiting for ENOSPC.
-  This prevents the hard-stop failures seen with Bush (7 albums of FLAC
-  filling 8GB before beets could import any of them).
-
-- PreLibraryFullError catch: even with proactive draining, a single very
-  large album could still fill the tmpfs on its own. Both move functions
-  now raise PreLibraryFullError on ENOSPC so the controller can do an
-  emergency drain and retry once.
-
-- metadata.py fix: the /pre-library/inbox/ path bug was in metadata.py's
-  load_basic_tags() fallback -- fixed there, not here. See metadata.py.
-
-- Version string updated to v7.7.
+Changes from v7.8:
+- Added PERMISSIONS_NEEDED_FLAG sentinel (/data/permissions_needed).
+  fix_library_permissions() now only runs when new files were actually
+  imported, skipping the expensive recursive find+chmod on runs where
+  the inbox was empty or all artists were skipped. The sentinel is
+  written by drain_prelibrary() after a successful import and cleared
+  after fix_library_permissions() completes.
 """
 import errno
 import fcntl
@@ -38,6 +22,7 @@ import time
 import shutil
 
 from scripts.pipeline.logging import log, update_status
+from scripts.pipeline.locking import library_write_lock
 from scripts.pipeline.slskd import artist_in_use, slskd_active_transfers
 from scripts.pipeline.sabnzbd import sabnzbd_is_processing
 from scripts.pipeline.settle import folder_is_settled
@@ -51,8 +36,6 @@ from scripts.pipeline.metadata import group_files_by_album
 from scripts.pipeline.beets import run_fingerprint, run_beets_import, run_post_import
 from scripts.pipeline.system_hooks import (
     fix_library_permissions,
-    trigger_subsonic_scan_from_config,
-    trigger_volumio_rescan,
 )
 from scripts.pipeline.util import INBOX, PRELIB
 from scripts.pipeline.quarantine import quarantine_failed_imports_global
@@ -62,38 +45,106 @@ from scripts.pipeline.regenerate import generate_ui_json
 CHUNK_SIZE = 500
 LOCK_FILE = Path("/data/pipeline.lock")
 
-# Drain pre-library when tmpfs usage reaches this percentage.
-# 85% gives enough headroom to move the next album before hitting 100%.
-PRELIB_DRAIN_THRESHOLD = 85
+# Drain pre-library when it reaches this percentage of its budget.
+# 85% gives enough headroom to move the next album before hitting the cap.
+PRELIB_DRAIN_THRESHOLD = int(os.getenv("PRELIB_DRAIN_THRESHOLD", "85"))
+
+# Size budget for /pre-library, in bytes.
+#
+# When /pre-library was a tmpfs, statvfs() on it returned the tmpfs's own
+# size, so "percent full" was meaningful. On a normal directory (e.g. an NVMe
+# bind mount) statvfs() returns the WHOLE FILESYSTEM's usage instead -- a 6 GB
+# pre-library on a 916 GB disk reads as ~1% and never drains, while unrelated
+# disk usage above 85% makes it drain constantly.
+#
+# So we measure the directory's own size against this budget. Set
+# PRELIB_MAX_BYTES to match whatever the old tmpfs size= was.
+PRELIB_MAX_BYTES = int(os.getenv("PRELIB_MAX_BYTES", str(6 * 1024**3)))
+
+AUDIO_GLOBS = ["**/*.flac", "**/*.mp3", "**/*.m4a", "**/*.ogg", "**/*.wav", "**/*.aac"]
+
+# Sentinel file written after any successful import. fix_library_permissions()
+# only runs when this file exists, avoiding an expensive recursive find+chmod
+# on runs where nothing was imported.
+PERMISSIONS_NEEDED_FLAG = Path("/data/permissions_needed")
 
 
 # ---------------------------------------------------------------------------
 # tmpfs monitoring
 # ---------------------------------------------------------------------------
 
+def _is_tmpfs(path: Path) -> bool:
+    """True if path sits on a tmpfs/ramfs mount."""
+    try:
+        target = os.path.realpath(str(path))
+        with open("/proc/mounts") as f:
+            best, fstype = "", ""
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt, typ = parts[1], parts[2]
+                if target == mnt or target.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > len(best):
+                        best, fstype = mnt, typ
+        return fstype in ("tmpfs", "ramfs")
+    except Exception:
+        return False
+
+
+def prelibrary_bytes_used() -> int:
+    """Sum of file sizes under PRELIB, excluding failed_imports."""
+    total = 0
+    if not PRELIB.exists():
+        return 0
+    for root, dirs, files in os.walk(str(PRELIB)):
+        if "failed_imports" in root.split(os.sep):
+            continue
+        dirs[:] = [d for d in dirs if d != "failed_imports"]
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
 def prelibrary_usage_pct() -> float:
     """
-    Return the pre-library tmpfs usage as a percentage (0.0 - 100.0).
-    Uses os.statvfs for an accurate kernel-level read -- no df subprocess.
-    Returns 0.0 if PRELIB doesn't exist or statvfs fails.
+    Percentage of the pre-library budget currently used (0.0 - 100.0).
+
+    On tmpfs, statvfs() describes the pre-library itself, so we use it -- it
+    is a single cheap syscall. On any other filesystem statvfs() describes the
+    whole disk, which is the wrong denominator entirely, so we walk the
+    directory and compare against PRELIB_MAX_BYTES.
+
+    Returns 0.0 if PRELIB doesn't exist or the check fails.
     """
     try:
-        st = os.statvfs(str(PRELIB))
-        total = st.f_blocks * st.f_frsize
-        free  = st.f_bfree  * st.f_frsize
-        if total == 0:
+        if not PRELIB.exists():
             return 0.0
-        used = total - free
-        pct = (used / total) * 100.0
-        return pct
+
+        if _is_tmpfs(PRELIB):
+            st = os.statvfs(str(PRELIB))
+            total = st.f_blocks * st.f_frsize
+            if total == 0:
+                return 0.0
+            used = total - (st.f_bfree * st.f_frsize)
+            return (used / total) * 100.0
+
+        if PRELIB_MAX_BYTES <= 0:
+            return 0.0
+        return (prelibrary_bytes_used() / PRELIB_MAX_BYTES) * 100.0
+
     except Exception as e:
-        log("[PRELIB] Could not read tmpfs usage: %s" % e)
+        log("[PRELIB] Could not read pre-library usage: %s" % e)
         return 0.0
 
 
 def log_prelibrary_usage():
     pct = prelibrary_usage_pct()
-    log("[PRELIB] Usage: %.1f%%" % pct)
+    mode = "tmpfs" if _is_tmpfs(PRELIB) else "dir/%dGB budget" % (PRELIB_MAX_BYTES // 1024**3)
+    log("[PRELIB] Usage: %.1f%% (%s)" % (pct, mode))
     return pct
 
 
@@ -137,11 +188,14 @@ def drain_prelibrary(reason: str = "startup"):
     Import whatever is in pre-library right now, then wipe it.
 
     Sequence: quarantine failed_imports -> fingerprint -> import ->
-              post-process -> clear.
+              post-process -> clear -> verify.
 
     Called at pipeline startup (to drain leftovers from the previous run)
     and mid-run when tmpfs usage hits PRELIB_DRAIN_THRESHOLD or when a
     PreLibraryFullError is raised.
+
+    Writes PERMISSIONS_NEEDED_FLAG after a successful import so
+    fix_library_permissions() runs at end of pipeline.
     """
     pct = prelibrary_usage_pct()
     log("[DRAIN] Draining pre-library (%s, current usage %.1f%%)..." % (reason, pct))
@@ -149,7 +203,41 @@ def drain_prelibrary(reason: str = "startup"):
     run_fingerprint()
     run_beets_import()
     run_post_import()
+
+    # Signal that new files were imported and need permissions fixed
+    try:
+        PERMISSIONS_NEEDED_FLAG.touch()
+    except Exception as e:
+        log("[DRAIN] Could not write permissions flag: %s" % e)
+
     clear_prelibrary()
+
+    # Verify the clear actually worked
+    survivors = [
+        f for pattern in AUDIO_GLOBS
+        for f in PRELIB.glob(pattern)
+        if "failed_imports" not in str(f)
+    ]
+    if survivors:
+        log("[DRAIN] WARNING: %d files survived clear_prelibrary() -- force removing:" % len(survivors))
+        for f in survivors:
+            log("[DRAIN]   %s" % f)
+            try:
+                f.unlink()
+            except Exception as e:
+                log("[DRAIN]   Could not remove %s: %s" % (f.name, e))
+        # Remove any now-empty dirs left behind
+        for item in list(PRELIB.iterdir()):
+            if item.name == "failed_imports":
+                continue
+            if item.is_dir():
+                try:
+                    shutil.rmtree(item)
+                except Exception as e:
+                    log("[DRAIN]   Could not remove dir %s: %s" % (item.name, e))
+    else:
+        log("[DRAIN] Pre-library confirmed empty after clear")
+
     log("[DRAIN] Pre-library drained (%.1f%% -> %.1f%%)" % (pct, prelibrary_usage_pct()))
 
 
@@ -162,7 +250,7 @@ def maybe_drain_prelibrary(context: str = ""):
     """
     pct = prelibrary_usage_pct()
     if pct >= PRELIB_DRAIN_THRESHOLD:
-        log("[PRELIB] Usage %.1f%% >= threshold %d%% — draining before next move%s" % (
+        log("[PRELIB] Usage %.1f%% >= threshold %d%% ? draining before next move%s" % (
             pct, PRELIB_DRAIN_THRESHOLD,
             (" (%s)" % context) if context else "",
         ))
@@ -271,17 +359,69 @@ def list_artist_folders():
     ]
 
 
+AUDIO_DECODE_EXTS = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac"}
+CORRUPTION_CHECK_TIMEOUT = 120
+
+
 def quick_corruption_check(filepath: Path) -> bool:
+    """Return True if the file is intact.
+
+    OLD BEHAVIOUR (bug): read the first 1024 bytes and returned True if at
+    least 100 came back. That only proves a file exists and has a header. It
+    cannot see damaged audio frames, which is precisely the corruption this
+    pipeline produces -- 551 full-size FLACs with valid headers and shredded
+    audio passed this check and were imported.
+
+    NEW BEHAVIOUR: cheap structural checks first (existence, size, magic
+    bytes), then an actual decode. For FLAC we use `flac -t`, which verifies
+    the MD5 of the decoded audio stored in STREAMINFO -- it catches both
+    truncation and mid-stream corruption. Falls back to ffmpeg for other
+    formats, or if the flac binary is unavailable.
+    """
     try:
-        if not filepath.exists() or filepath.stat().st_size == 0:
-            log("[CORRUPT] Empty or missing: %s" % filepath.name)
+        if not filepath.exists():
+            log("[CORRUPT] Missing: %s" % filepath.name)
             return False
+
+        size = filepath.stat().st_size
+        if size < 4096:
+            log("[CORRUPT] Too small (%d bytes): %s" % (size, filepath.name))
+            return False
+
+        ext = filepath.suffix.lower()
+        if ext not in AUDIO_DECODE_EXTS:
+            return True  # not ours to judge
+
         with open(filepath, "rb") as f:
-            header = f.read(1024)
-            if len(header) < 100:
-                log("[CORRUPT] File too small: %s" % filepath.name)
-                return False
+            magic = f.read(4)
+        if ext == ".flac" and magic != b"fLaC":
+            log("[CORRUPT] Bad FLAC magic bytes: %s" % filepath.name)
+            return False
+
+        if ext == ".flac" and shutil.which("flac"):
+            # -t: test. Verifies the STREAMINFO MD5 against decoded audio.
+            cmd = ["flac", "-t", "--totally-silent", str(filepath)]
+        elif shutil.which("ffmpeg"):
+            cmd = ["ffmpeg", "-v", "error", "-i", str(filepath), "-f", "null", "-"]
+        else:
+            log("[CORRUPT] No flac/ffmpeg available; skipping deep check for %s"
+                % filepath.name)
+            return True
+
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=CORRUPTION_CHECK_TIMEOUT)
+        if result.returncode != 0 or result.stderr.strip():
+            detail = (result.stderr or "").strip().splitlines()
+            first = detail[0] if detail else "rc=%d" % result.returncode
+            log("[CORRUPT] Decode failed for %s: %s" % (filepath.name, first))
+            return False
+
         return True
+
+    except subprocess.TimeoutExpired:
+        log("[CORRUPT] Decode timed out (%ds): %s"
+            % (CORRUPTION_CHECK_TIMEOUT, filepath.name))
+        return False
     except Exception as e:
         log("[CORRUPT] Cannot read %s: %s" % (filepath.name, e))
         return False
@@ -433,7 +573,7 @@ def process_artist(artist_folder: Path, active_paths):
                     try:
                         move_existing_album_folder_to_prelibrary(album)
                     except (PreLibraryFullError, Exception) as retry_err:
-                        log("[ENOSPC] Retry failed for %s: %s — skipping" % (album.name, retry_err))
+                        log("[ENOSPC] Retry failed for %s: %s ? skipping" % (album.name, retry_err))
 
             log("[CHUNK] Fingerprinting chunk %d" % chunk_idx)
             run_fingerprint()
@@ -489,7 +629,7 @@ def process_artist(artist_folder: Path, active_paths):
                                 files,
                             )
                         except (PreLibraryFullError, Exception) as retry_err:
-                            log("[ENOSPC] Retry failed for %s/%s: %s — skipping" % (aa, al, retry_err))
+                            log("[ENOSPC] Retry failed for %s/%s: %s ? skipping" % (aa, al, retry_err))
 
                 log("[CHUNK] Fingerprinting loose chunk %d" % chunk_idx)
                 run_fingerprint()
@@ -518,15 +658,21 @@ def process_artist(artist_folder: Path, active_paths):
 
 def main():
     try:
-        with PipelineLock(timeout=5):
-            log("=== v7.7 Hybrid Pipeline Controller ===")
+        # PipelineLock stops two pipeline runs overlapping.
+        # library_write_lock stops the pipeline overlapping with
+        # watch_metadata.py or beets_metadata_refresh.py. All three run `beet`
+        # commands that rewrite audio files, and two concurrent rewrites of one
+        # FLAC shred it. Blocking here rather than skipping: a pipeline run
+        # that waits a few minutes is fine; one that runs alongside the 03:00
+        # metadata refresh is how 1,002 files died.
+        with PipelineLock(timeout=5), library_write_lock("pipeline_controller"):
+            log("=== v8.0 Hybrid Pipeline Controller ===")
             update_status("running", "starting pipeline")
 
             cleanup_invalid_failed_imports()
 
             # Drain pre-library at startup: give leftover files from the
             # previous run one more import attempt before clearing.
-            # This replaces the v7.6 plain clear_prelibrary() call.
             log("[PRELIB] Draining pre-library leftovers before new run...")
             drain_prelibrary("startup")
 
@@ -560,12 +706,20 @@ def main():
                     log("[ERROR] Traceback: %s" % traceback.format_exc())
 
             time.sleep(2)
-            fix_library_permissions()
-            generate_ui_json()
-            trigger_subsonic_scan_from_config()
-            trigger_volumio_rescan()
 
-            log("=== v7.7 Pipeline Finished ===")
+            # Only run expensive permission fix if new files were imported
+            if PERMISSIONS_NEEDED_FLAG.exists():
+                fix_library_permissions()
+                try:
+                    PERMISSIONS_NEEDED_FLAG.unlink(missing_ok=True)
+                except Exception as e:
+                    log("[PERMISSIONS] Could not remove flag: %s" % e)
+            else:
+                log("[PERMISSIONS] No new imports -- skipping permission fix")
+
+            generate_ui_json()
+
+            log("=== v7.9 Pipeline Finished ===")
             update_status("success", "pipeline finished")
 
     except RuntimeError as e:
